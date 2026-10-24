@@ -18,6 +18,12 @@ jobs:
           unzip -oq app-source.zip
           test -f app/build.gradle.kts
           test -f app/src/main/AndroidManifest.xml
+      - name: Apply v1.1 display and auto-refresh fixes
+        run: |
+          base64 --decode upgrade-v1.1.patch.xz.b64 | xz -dc > upgrade-v1.1.patch
+          patch -p1 --batch < upgrade-v1.1.patch
+          grep -q 'versionCode = 2' app/build.gradle.kts
+          test -f app/src/main/java/com/byso/halocardoverlay/DashboardAccessibilityService.kt
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -43,4 +49,4 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create v1.0.0 "app/build/outputs/apk/debug/app-debug.apk#HaloCardLiveOverlay-v1.0.apk" --title "HaloCard Live Overlay 1.0" --notes "First test version. Android debug-signed APK; later updates may require uninstall unless a stable signing key is configured." --target "$GITHUB_SHA" || gh release upload v1.0.0 "app/build/outputs/apk/debug/app-debug.apk#HaloCardLiveOverlay-v1.0.apk" --clobber
+          gh release create v1.1.0 "app/build/outputs/apk/debug/app-debug.apk#HaloCardLiveOverlay-v1.1.apk" --title "HaloCard Live Overlay 1.1" --notes "Version 1.1: dashboard-only overlay, continuous refresh, and draggable saved position. Debug signed: previous v1.0 may need uninstall because GitHub runners use different debug keys. Enable the new Accessibility permission for Chrome URL detection." --target "$GITHUB_SHA" || gh release upload v1.1.0 "app/build/outputs/apk/debug/app-debug.apk#HaloCardLiveOverlay-v1.1.apk" --clobber
