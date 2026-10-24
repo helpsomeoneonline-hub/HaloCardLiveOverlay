@@ -1,0 +1,453 @@
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -11,8 +11,8 @@
+         applicationId = "com.byso.halocardoverlay"
+         minSdk = 26
+         targetSdk = 35
+-        versionCode = 5
+-        versionName = "1.4"
++        versionCode = 6
++        versionName = "1.5"
+     }
+ 
+     compileOptions {
+--- a/app/src/main/java/com/byso/halocardoverlay/BalanceCaptureService.kt
++++ b/app/src/main/java/com/byso/halocardoverlay/BalanceCaptureService.kt
+@@ -19,6 +19,7 @@
+ import android.media.projection.MediaProjectionManager
+ import android.os.Build
+ import android.os.Handler
++import android.os.HandlerThread
+ import android.os.IBinder
+ import android.os.Looper
+ import android.view.Gravity
+@@ -51,11 +52,13 @@
+     }
+ 
+     private val mainHandler = Handler(Looper.getMainLooper())
++    private val scanThread = HandlerThread("HaloCardFrameCopy").apply { start() }
++    private val scanHandler = Handler(scanThread.looper)
+     private val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+     private val windowManager by lazy { getSystemService(WINDOW_SERVICE) as WindowManager }
+     private var projection: MediaProjection? = null
+     private var virtualDisplay: VirtualDisplay? = null
+-    private var imageReader: ImageReader? = null
++    @Volatile private var imageReader: ImageReader? = null
+     private var captureWidth = 0
+     private var captureHeight = 0
+     private var overlay: View? = null
+@@ -64,9 +67,9 @@
+     private var detailLabel: TextView? = null
+     private var titleLabel: TextView? = null
+     private var minimized = false
+-    private var scanning = false
+-    private var destroyed = false
+-    private var overlayVisible = false
++    @Volatile private var scanning = false
++    @Volatile private var destroyed = false
++    @Volatile private var overlayVisible = false
+     private val visibilityRunnable = object : Runnable {
+         override fun run() {
+             if (destroyed) return
+@@ -78,7 +81,7 @@
+         val prefs = getSharedPreferences("dashboard_visibility", MODE_PRIVATE)
+         val lastCheck = prefs.getLong("checked_at", 0L)
+         val dashboard = prefs.getBoolean("visible", false) &&
+-            System.currentTimeMillis() - lastCheck in 0L..2800L
++            System.currentTimeMillis() - lastCheck in 0L..4200L
+         val panel = overlay ?: return
+         if (dashboard != overlayVisible) {
+             overlayVisible = dashboard
+@@ -110,7 +113,7 @@
+         override fun run() {
+             if (destroyed) return
+             if (!scanning) scanFrame()
+-            mainHandler.postDelayed(this, POLL_MS)
++            scanHandler.postDelayed(this, POLL_MS)
+         }
+     }
+ 
+@@ -149,7 +152,7 @@
+                     refreshDashboardVisibility()
+                     mainHandler.post(visibilityRunnable)
+                     startCapture(result)
+-                    mainHandler.post(scanRunnable)
++                    scanHandler.post(scanRunnable)
+                     getSharedPreferences("capture_status", MODE_PRIVATE).edit().putString("status", "Running — waiting for HaloCard dashboard").apply()
+                 } catch (ex: Exception) {
+                     getSharedPreferences("capture_status", MODE_PRIVATE).edit().putString("status", "Capture failed: ${ex.localizedMessage ?: "permission error"}").apply()
+@@ -230,6 +233,7 @@
+     }
+ 
+     private fun scanFrame() {
++        if (destroyed || !overlayVisible) return
+         val reader = imageReader ?: return
+         val image = try { reader.acquireLatestImage() } catch (_: Exception) { null } ?: return
+         val bitmap = try {
+@@ -293,6 +297,7 @@
+ 
+     private fun showStatus(primary: String, details: String) {
+         mainHandler.post {
++            if (destroyed) return@post
+             balanceLabel?.text = primary
+             detailLabel?.text = details
+             titleLabel?.text = if (minimized) "LIVE" else "HALOCARD • LIVE"
+@@ -413,7 +418,8 @@
+ 
+     override fun onDestroy() {
+         destroyed = true
+-        mainHandler.removeCallbacks(scanRunnable)
++        scanHandler.removeCallbacks(scanRunnable)
++        scanThread.quitSafely()
+         mainHandler.removeCallbacks(visibilityRunnable)
+         try { projection?.unregisterCallback(captureCallback) } catch (_: Exception) {}
+         try { virtualDisplay?.release() } catch (_: Exception) {}
+--- a/app/src/main/java/com/byso/halocardoverlay/DashboardAccessibilityService.kt
++++ b/app/src/main/java/com/byso/halocardoverlay/DashboardAccessibilityService.kt
+@@ -3,201 +3,198 @@
+ import android.accessibilityservice.AccessibilityService
+ import android.accessibilityservice.AccessibilityServiceInfo
+ import android.os.Handler
+-import android.os.Looper
++import android.os.HandlerThread
++import android.os.SystemClock
+ import android.view.accessibility.AccessibilityEvent
+ import android.view.accessibility.AccessibilityNodeInfo
+ import java.util.Locale
+ 
+ /**
+- * Only exposes HaloCard when the CURRENT browser tab's actual address bar is
+- * verifiably on secure.halocard.co/dashboard. Never treat page content, an
+- * inactive tab title, or a tab preview as evidence of the current URL.
+- * No URLs or page content are persisted or transmitted.
++ * Verifies the FOREGROUND browser tab. Accessibility node queries can be slow,
++ * particularly with Firefox/GeckoView, so never traverse them on the app UI
++ * thread. If the current address cannot be verified, fail closed (hide overlay).
++ * No visited addresses or page content are saved.
+  */
+ class DashboardAccessibilityService : AccessibilityService() {
+-    private val handler = Handler(Looper.getMainLooper())
+-    private val browserPackages = setOf(
++    private val browsers = setOf(
+         "com.android.chrome", "com.chrome.beta", "com.chrome.dev", "com.chrome.canary",
+         "org.mozilla.firefox", "org.mozilla.firefox_beta", "org.mozilla.fenix"
+     )
+-    private var running = false
+-    private var firefoxTabTransitionUntil = 0L
+-    private val inspectTask = object : Runnable {
++    private val addressIds = listOf(
++        "url_bar", "location_bar", "search_box_text", "omnibox", "url_view",
++        "url_edit", "url_input", "display_url", "edit_url", "toolbar_url",
++        "mozac_browser_toolbar_url_view", "mozac_browser_toolbar_url_edit",
++        "mozac_browser_toolbar_url", "url_text", "url_field", "address_bar"
++    )
++    private val dashboardUrl = Regex(
++        "(?<![a-z0-9.-])(?:https?://)?secure\\.halocard\\.co/dashboard(?:[/?#]|\\b)",
++        RegexOption.IGNORE_CASE
++    )
++    private val dashboardHost = Regex(
++        "(?<![a-z0-9.-])(?:https?://)?secure\\.halocard\\.co(?:[/\\s,]|$)",
++        RegexOption.IGNORE_CASE
++    )
++    private lateinit var worker: HandlerThread
++    private var checks: Handler? = null
++    @Volatile private var running = false
++    @Volatile private var tabTransitionUntil = 0L
++
++    private val periodic = object : Runnable {
+         override fun run() {
+             if (!running) return
+-            inspectActiveWindow()
+-            handler.postDelayed(this, 425L)
+-        }
+-    }
++            inspectSafely()
++            checks?.postDelayed(this, 1150L)
++        }
++    }
++    private val onEventCheck = Runnable { if (running) inspectSafely() }
+ 
+     override fun onServiceConnected() {
+         super.onServiceConnected()
+         serviceInfo = serviceInfo.apply {
+             flags = flags or AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS
+         }
++        worker = HandlerThread("HaloCardBrowserCheck").apply { start() }
++        checks = Handler(worker.looper)
+         running = true
+-        handler.removeCallbacks(inspectTask)
+-        inspectTask.run()
++        checks?.post(periodic)
+     }
+ 
+     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+         if (!running || event == null) return
+         val pkg = event.packageName?.toString().orEmpty()
+-        if (pkg.startsWith("org.mozilla.")) {
+-            val clickedOrSelected = event.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED ||
+-                event.eventType == AccessibilityEvent.TYPE_VIEW_SELECTED
+-            if (clickedOrSelected) {
+-                val source = event.source
+-                try {
+-                    val viewId = source?.viewIdResourceName?.lowercase(Locale.ROOT).orEmpty()
+-                    val role = source?.contentDescription?.toString()?.lowercase(Locale.ROOT).orEmpty()
+-                    val type = event.className?.toString()?.lowercase(Locale.ROOT).orEmpty()
+-                    // Firefox desktop-style tab strip and tab tray use differing IDs.
+-                    val tabButton = viewId.contains("tab_") || viewId.endsWith("_tab") ||
+-                        viewId.contains("tabstrip") || viewId.contains("tab_strip") ||
+-                        role.contains("tab ") || role.contains("tabs") ||
+-                        type.endsWith("tab") || type.contains("tablayout")
+-                    if (tabButton) {
+-                        firefoxTabTransitionUntil = System.currentTimeMillis() + 500L
+-                        setSiteState(false, "Firefox tab changed — checking active URL")
+-                    }
+-                } finally {
+-                    source?.recycle()
+-                }
+-            }
+-        }
+-        handler.post { inspectActiveWindow() }
+-    }
+-
+-    override fun onInterrupt() { setSiteState(false, "Accessibility interrupted") }
++        // No event.source access here: on Firefox that binder call can block
++        // the main thread and cause a system "app isn't responding" dialog.
++        if (pkg !in browsers) {
++            checks?.post { setState(false, "Outside supported browser") }
++            return
++        }
++        if (pkg.startsWith("org.mozilla.") &&
++            (event.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED ||
++                event.eventType == AccessibilityEvent.TYPE_VIEW_SELECTED ||
++                event.eventType == AccessibilityEvent.TYPE_WINDOWS_CHANGED)) {
++            val type = event.className?.toString()?.lowercase(Locale.ROOT).orEmpty()
++            val description = event.contentDescription?.toString()?.lowercase(Locale.ROOT).orEmpty()
++            val probablyTabs = type.contains("tab") || description.contains("switch tab") ||
++                description.contains("tab tray") || description.contains("tabs")
++            if (probablyTabs || event.eventType == AccessibilityEvent.TYPE_WINDOWS_CHANGED) {
++                tabTransitionUntil = SystemClock.elapsedRealtime() + 450L
++                checks?.post { setState(false, "Checking newly selected Firefox tab") }
++            }
++        }
++        // Collapse the often massive stream of Firefox content events into one
++        // check; the periodic check also runs even under nonstop events.
++        checks?.removeCallbacks(onEventCheck)
++        checks?.postDelayed(onEventCheck, 350L)
++    }
++
++    override fun onInterrupt() { checks?.post { setState(false, "Accessibility interrupted") } }
+ 
+     override fun onDestroy() {
+         running = false
+-        handler.removeCallbacks(inspectTask)
+-        setSiteState(false, "Accessibility stopped")
++        checks?.removeCallbacks(onEventCheck)
++        checks?.removeCallbacks(periodic)
++        setState(false, "Accessibility stopped")
++        if (::worker.isInitialized) worker.quitSafely()
+         super.onDestroy()
+     }
+ 
++    private fun inspectSafely() {
++        try { inspectActiveWindow() }
++        catch (_: Exception) { setState(false, "Browser check failed — retrying") }
++    }
++
+     private fun inspectActiveWindow() {
+-        if (System.currentTimeMillis() < firefoxTabTransitionUntil) {
+-            setSiteState(false, "Firefox tab changed — checking active URL")
++        if (SystemClock.elapsedRealtime() < tabTransitionUntil) {
++            setState(false, "Firefox tab change in progress")
+             return
+         }
+         val root = rootInActiveWindow ?: run {
+-            setSiteState(false, "No active browser window")
++            setState(false, "Active browser window not available")
+             return
+         }
++        val queue = ArrayDeque<AccessibilityNodeInfo>()
++        queue.add(root)
++        var urlsFound = false
++        var hostFound = false
++        var dashboardText = false
++        var cardsText = false
++        var tabTrayOpen = false
++        var isFirefox = false
++        var visited = 0
++        val start = SystemClock.elapsedRealtime()
+         try {
+             val pkg = root.packageName?.toString().orEmpty()
+-            if (pkg !in browserPackages) {
+-                setSiteState(false, "Outside supported browser")
++            if (pkg !in browsers) {
++                setState(false, "Outside supported browser")
+                 return
+             }
+-            val isFirefox = pkg.startsWith("org.mozilla.")
+-            val candidateUrls = mutableListOf<String>()
+-            var dashboardText = false
+-            var cardsText = false
+-            var tabTrayOpen = false
+-            val stack = ArrayDeque<AccessibilityNodeInfo>()
+-            stack.add(root)
+-            var count = 0
+-            while (stack.isNotEmpty() && count < 1800) {
+-                val node = stack.removeLast()
+-                count++
+-                if (!node.isVisibleToUser) continue
+-                val viewId = node.viewIdResourceName?.lowercase(Locale.ROOT).orEmpty()
+-                val clazz = node.className?.toString()?.lowercase(Locale.ROOT).orEmpty()
+-                if (isFirefox && (
+-                        viewId.contains("tabs_tray") || viewId.contains("tabstray") ||
+-                        viewId.contains("tab_tray") || viewId.contains("tabs_panel") ||
+-                        clazz.contains("tabstray"))) {
+-                    tabTrayOpen = true
+-                }
+-                val text = node.text?.toString().orEmpty()
+-                val description = node.contentDescription?.toString().orEmpty()
+-                if (text.contains("spending power", true) || description.contains("spending power", true)) dashboardText = true
+-                if (text.contains("new card", true) || text.contains("all-time limit", true)) cardsText = true
+-
+-                // Critical: URLs found in arbitrary Firefox tab cards, history,
+-                // site content or link text MUST NOT authorize the overlay.
+-                if (isActiveAddressControl(node, viewId)) {
+-                    candidateUrls.add(text)
+-                    candidateUrls.add(description)
+-                }
+-                for (i in 0 until node.childCount) {
+-                    node.getChild(i)?.let { stack.add(it) }
+-                }
++            isFirefox = pkg.startsWith("org.mozilla.")
++            // BFS sees toolbar siblings before traversing a deep webpage subtree.
++            while (queue.isNotEmpty() && visited < 420 &&
++                   SystemClock.elapsedRealtime() - start < 110L) {
++                val node = queue.removeFirst()
++                try {
++                    visited++
++                    if (!node.isVisibleToUser) continue
++                    val id = node.viewIdResourceName?.lowercase(Locale.ROOT).orEmpty()
++                    val clazz = node.className?.toString()?.lowercase(Locale.ROOT).orEmpty()
++                    if (isFirefox && (id.contains("tab_tray") || id.contains("tabs_tray") ||
++                        id.contains("tabstray") || id.contains("tabs_panel") || clazz.contains("tabstray"))) {
++                        tabTrayOpen = true
++                    }
++                    val content = node.text?.toString().orEmpty()
++                    val description = node.contentDescription?.toString().orEmpty()
++                    if (content.contains("spending power", true) || description.contains("spending power", true)) dashboardText = true
++                    if (content.contains("new card", true) || content.contains("all-time limit", true)) cardsText = true
++                    if (isAddressNode(node, id)) {
++                        if (dashboardUrl.containsMatchIn(content) || dashboardUrl.containsMatchIn(description)) urlsFound = true
++                        if (dashboardHost.containsMatchIn(content) || dashboardHost.containsMatchIn(description)) hostFound = true
++                    }
++                    for (i in 0 until node.childCount) {
++                        node.getChild(i)?.let { queue.add(it) }
++                    }
++                } finally { node.recycle() }
+             }
+             if (tabTrayOpen) {
+-                setSiteState(false, "Firefox tab selector open")
+-                return
+-            }
+-            val exactUrl = candidateUrls.any(::isExactDashboardUrl)
+-            val collapsedAddress = candidateUrls.any(::isSecureHaloCardHost) && dashboardText && cardsText
+-            if (exactUrl || collapsedAddress) {
+-                setSiteState(true, "Active HaloCard dashboard verified in ${if (isFirefox) "Firefox" else "Chrome"}")
++                setState(false, "Firefox tab selector open")
++            } else if (urlsFound || (hostFound && dashboardText && cardsText)) {
++                setState(true, "HaloCard active in ${if (isFirefox) "Firefox" else "Chrome"}")
+             } else {
+-                setSiteState(false, if (candidateUrls.isEmpty())
+-                    "Active browser address unavailable — overlay hidden"
+-                else "Current tab is not HaloCard dashboard")
++                setState(false, if (!hostFound && !urlsFound)
++                    "Current tab URL not verified — overlay hidden"
++                    else "Current tab is not confirmed as dashboard")
+             }
+         } finally {
+-            root.recycle()
+-        }
+-    }
+-
+-    private fun isActiveAddressControl(node: AccessibilityNodeInfo, viewId: String): Boolean {
+-        // Resource IDs on the address edit/display control, not on its broad
+-        // toolbar container or the tab strip (which may contain previous URLs).
+-        val last = viewId.substringAfterLast(":id/", viewId)
+-        val addressId = listOf(
+-            "url_bar", "location_bar", "search_box_text", "omnibox",
+-            "url_view", "url_edit", "url_input", "display_url", "edit_url",
+-            "toolbar_url", "mozac_browser_toolbar_url_view", "mozac_browser_toolbar_url_edit",
+-            "mozac_browser_toolbar_url", "url_text", "url_field", "address_bar"
+-        ).any { part -> last == part || last.startsWith("${part}_") || last.endsWith("_${part}") }
+-        if (addressId) return true
+-
+-        // On some Firefox builds the address is an unlabeled text/control child
+-        // of the Mozac toolbar, but not a tab-strip or an offscreen URL preview.
+-        val value = (node.text?.toString().orEmpty() + " " +
+-            node.contentDescription?.toString().orEmpty())
+-        if (!value.contains("halocard.co", true)) return false
+-        if (!node.isClickable && !node.isEditable) return false
++            // Recycle queued, unvisited nodes too; do not recycle root twice.
++            while (queue.isNotEmpty()) queue.removeFirst().recycle()
++        }
++    }
++
++    private fun isAddressNode(node: AccessibilityNodeInfo, id: String): Boolean {
++        val last = id.substringAfterLast(":id/", id)
++        if (addressIds.any { key -> last == key || last.startsWith("${key}_") || last.endsWith("_${key}") }) return true
++        // GeckoView sometimes emits an unlabeled address value. Accept it only
++        // when the control has a browser-toolbar ancestor, not an inactive tab.
++        val text = node.text?.toString().orEmpty() + " " + node.contentDescription?.toString().orEmpty()
++        if (!text.contains("halocard.co", true) || (!node.isClickable && !node.isEditable)) return false
+         var parent = node.parent
+-        var levels = 0
+-        while (parent != null && levels++ < 5) {
+-            val id = parent.viewIdResourceName?.lowercase(Locale.ROOT).orEmpty()
+-            val next = parent.parent
+-            if (id.contains("tab") && !id.contains("toolbar")) {
++        var depth = 0
++        try {
++            while (parent != null && depth++ < 4) {
++                val parentId = parent.viewIdResourceName?.lowercase(Locale.ROOT).orEmpty()
++                if (parentId.contains("tab") && !parentId.contains("toolbar")) return false
++                if (parentId.contains("browser_toolbar") || parentId.contains("toolbar_layout")) return true
++                val next = parent.parent
+                 parent.recycle()
+-                // Parent traversal ends here; do not read other window nodes.
+-                next?.recycle()
+-                return false
+-            }
+-            if (id.contains("browser_toolbar") || id.contains("mozac_browser_toolbar") ||
+-                id.contains("toolbar_layout")) {
+-                parent.recycle()
+-                next?.recycle()
+-                return true
+-            }
+-            parent.recycle()
+-            parent = next
+-        }
+-        return false
+-    }
+-
+-    private fun isExactDashboardUrl(text: String): Boolean =
+-        Regex("(?<![a-z0-9.-])(?:https?://)?secure\\.halocard\\.co/dashboard(?:[/?#]|\\b)", RegexOption.IGNORE_CASE)
+-            .containsMatchIn(text.trim())
+-
+-    private fun isSecureHaloCardHost(text: String): Boolean =
+-        Regex("(?<![a-z0-9.-])(?:https?://)?secure\\.halocard\\.co(?:[/\\s,]|$)", RegexOption.IGNORE_CASE)
+-            .containsMatchIn(text.trim())
+-
+-    private fun setSiteState(show: Boolean, status: String) {
++                parent = next
++            }
++            return false
++        } finally { parent?.recycle() }
++    }
++
++    private fun setState(visible: Boolean, status: String) {
+         getSharedPreferences("dashboard_visibility", MODE_PRIVATE).edit()
+-            .putBoolean("visible", show)
++            .putBoolean("visible", visible)
+             .putString("status", status)
+             .putLong("checked_at", System.currentTimeMillis())
+             .apply()
+
