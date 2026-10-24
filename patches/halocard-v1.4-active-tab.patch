@@ -1,0 +1,281 @@
+--- a/app/src/main/java/com/byso/halocardoverlay/DashboardAccessibilityService.kt
++++ b/app/src/main/java/com/byso/halocardoverlay/DashboardAccessibilityService.kt
+@@ -8,7 +8,12 @@
+ import android.view.accessibility.AccessibilityNodeInfo
+ import java.util.Locale
+ 
+-/** Checks the active Chrome / Firefox address bar; never transmits URLs or screenshots. */
++/**
++ * Only exposes HaloCard when the CURRENT browser tab's actual address bar is
++ * verifiably on secure.halocard.co/dashboard. Never treat page content, an
++ * inactive tab title, or a tab preview as evidence of the current URL.
++ * No URLs or page content are persisted or transmitted.
++ */
+ class DashboardAccessibilityService : AccessibilityService() {
+     private val handler = Handler(Looper.getMainLooper())
+     private val browserPackages = setOf(
+@@ -16,11 +21,12 @@
+         "org.mozilla.firefox", "org.mozilla.firefox_beta", "org.mozilla.fenix"
+     )
+     private var running = false
++    private var firefoxTabTransitionUntil = 0L
+     private val inspectTask = object : Runnable {
+         override fun run() {
+             if (!running) return
+             inspectActiveWindow()
+-            handler.postDelayed(this, 650L)
++            handler.postDelayed(this, 425L)
+         }
+     }
+ 
+@@ -35,10 +41,36 @@
+     }
+ 
+     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+-        if (running) handler.post { inspectActiveWindow() }
++        if (!running || event == null) return
++        val pkg = event.packageName?.toString().orEmpty()
++        if (pkg.startsWith("org.mozilla.")) {
++            val clickedOrSelected = event.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED ||
++                event.eventType == AccessibilityEvent.TYPE_VIEW_SELECTED
++            if (clickedOrSelected) {
++                val source = event.source
++                try {
++                    val viewId = source?.viewIdResourceName?.lowercase(Locale.ROOT).orEmpty()
++                    val role = source?.contentDescription?.toString()?.lowercase(Locale.ROOT).orEmpty()
++                    val type = event.className?.toString()?.lowercase(Locale.ROOT).orEmpty()
++                    // Firefox desktop-style tab strip and tab tray use differing IDs.
++                    val tabButton = viewId.contains("tab_") || viewId.endsWith("_tab") ||
++                        viewId.contains("tabstrip") || viewId.contains("tab_strip") ||
++                        role.contains("tab ") || role.contains("tabs") ||
++                        type.endsWith("tab") || type.contains("tablayout")
++                    if (tabButton) {
++                        firefoxTabTransitionUntil = System.currentTimeMillis() + 500L
++                        setSiteState(false, "Firefox tab changed — checking active URL")
++                    }
++                } finally {
++                    source?.recycle()
++                }
++            }
++        }
++        handler.post { inspectActiveWindow() }
+     }
+ 
+     override fun onInterrupt() { setSiteState(false, "Accessibility interrupted") }
++
+     override fun onDestroy() {
+         running = false
+         handler.removeCallbacks(inspectTask)
+@@ -47,81 +79,127 @@
+     }
+ 
+     private fun inspectActiveWindow() {
++        if (System.currentTimeMillis() < firefoxTabTransitionUntil) {
++            setSiteState(false, "Firefox tab changed — checking active URL")
++            return
++        }
+         val root = rootInActiveWindow ?: run {
+-            // A null root can occur momentarily during a page transition. The
+-            // overlay service treats stale checks as unsafe and hides itself.
++            setSiteState(false, "No active browser window")
+             return
+         }
+         try {
+-            val activePackage = root.packageName?.toString().orEmpty()
+-            if (activePackage !in browserPackages) {
+-                setSiteState(false, "Open HaloCard dashboard in Chrome or Firefox")
++            val pkg = root.packageName?.toString().orEmpty()
++            if (pkg !in browserPackages) {
++                setSiteState(false, "Outside supported browser")
+                 return
+             }
+-            val urlCandidates = ArrayList<String>()
++            val isFirefox = pkg.startsWith("org.mozilla.")
++            val candidateUrls = mutableListOf<String>()
+             var dashboardText = false
+             var cardsText = false
++            var tabTrayOpen = false
+             val stack = ArrayDeque<AccessibilityNodeInfo>()
+             stack.add(root)
+-            var visited = 0
+-            while (stack.isNotEmpty() && visited < 1600) {
++            var count = 0
++            while (stack.isNotEmpty() && count < 1800) {
+                 val node = stack.removeLast()
+-                visited++
++                count++
++                if (!node.isVisibleToUser) continue
++                val viewId = node.viewIdResourceName?.lowercase(Locale.ROOT).orEmpty()
++                val clazz = node.className?.toString()?.lowercase(Locale.ROOT).orEmpty()
++                if (isFirefox && (
++                        viewId.contains("tabs_tray") || viewId.contains("tabstray") ||
++                        viewId.contains("tab_tray") || viewId.contains("tabs_panel") ||
++                        clazz.contains("tabstray"))) {
++                    tabTrayOpen = true
++                }
+                 val text = node.text?.toString().orEmpty()
+                 val description = node.contentDescription?.toString().orEmpty()
+-                val viewId = node.viewIdResourceName?.lowercase(Locale.ROOT).orEmpty()
+                 if (text.contains("spending power", true) || description.contains("spending power", true)) dashboardText = true
+                 if (text.contains("new card", true) || text.contains("all-time limit", true)) cardsText = true
+-                if (viewId.contains("url_bar") || viewId.contains("location_bar") ||
+-                    viewId.contains("search_box_text") || viewId.contains("omnibox") ||
+-                    // Firefox for Android (Fenix / GeckoView) has different URL widgets.
+-                    viewId.contains("url_view") || viewId.contains("url_edit") ||
+-                    viewId.contains("url_input") || viewId.contains("mozac_browser_toolbar") ||
+-                    viewId.contains("display_url") || viewId.contains("edit_url")) {
+-                    urlCandidates.add(text)
+-                    urlCandidates.add(description)
+-                }
+-                // Chrome and Firefox can expose the URL in a parent spoken description.
+-                if (text.contains("halocard.co", true) || description.contains("halocard.co", true)) {
+-                    urlCandidates.add(text)
+-                    urlCandidates.add(description)
++
++                // Critical: URLs found in arbitrary Firefox tab cards, history,
++                // site content or link text MUST NOT authorize the overlay.
++                if (isActiveAddressControl(node, viewId)) {
++                    candidateUrls.add(text)
++                    candidateUrls.add(description)
+                 }
+                 for (i in 0 until node.childCount) {
+                     node.getChild(i)?.let { stack.add(it) }
+                 }
+             }
+-            val fullDashboard = urlCandidates.any { isDashboardUrl(it) }
+-            // Either browser may display only the host in its collapsed address bar.
+-            // In that case, require dashboard-specific controls as a second signal.
+-            val hostAndDashboard = urlCandidates.any { isAllowedHostOnly(it) } && dashboardText && cardsText
+-            if (fullDashboard || hostAndDashboard) {
+-                setSiteState(true, "HaloCard dashboard detected")
++            if (tabTrayOpen) {
++                setSiteState(false, "Firefox tab selector open")
++                return
++            }
++            val exactUrl = candidateUrls.any(::isExactDashboardUrl)
++            val collapsedAddress = candidateUrls.any(::isSecureHaloCardHost) && dashboardText && cardsText
++            if (exactUrl || collapsedAddress) {
++                setSiteState(true, "Active HaloCard dashboard verified in ${if (isFirefox) "Firefox" else "Chrome"}")
+             } else {
+-                setSiteState(false, if (urlCandidates.isEmpty()) "Browser address not detected" else "Not on HaloCard dashboard")
++                setSiteState(false, if (candidateUrls.isEmpty())
++                    "Active browser address unavailable — overlay hidden"
++                else "Current tab is not HaloCard dashboard")
+             }
+         } finally {
+             root.recycle()
+         }
+     }
+ 
+-    private fun isDashboardUrl(candidate: String): Boolean {
+-        val cleaned = candidate.trim().lowercase(Locale.ROOT)
+-            .replace("address and search bar", "").replace("current page", "")
+-        // Only actual URL-like text; prevents look-alike hosts such as halocard.co.evil.tld.
+-        val regex = Regex("(?<![a-z0-9.-])(?:https?://)?(?:secure\\.)?halocard\\.co/dashboard(?:[/?#]|\\b)")
+-        return regex.containsMatchIn(cleaned)
+-    }
+-    private fun isAllowedHostOnly(candidate: String): Boolean {
+-        val cleaned = candidate.trim().lowercase(Locale.ROOT)
+-        return Regex("(?<![a-z0-9.-])(?:https?://)?(?:secure\\.)?halocard\\.co(?:[/\\s,]|$)").containsMatchIn(cleaned)
+-    }
++    private fun isActiveAddressControl(node: AccessibilityNodeInfo, viewId: String): Boolean {
++        // Resource IDs on the address edit/display control, not on its broad
++        // toolbar container or the tab strip (which may contain previous URLs).
++        val last = viewId.substringAfterLast(":id/", viewId)
++        val addressId = listOf(
++            "url_bar", "location_bar", "search_box_text", "omnibox",
++            "url_view", "url_edit", "url_input", "display_url", "edit_url",
++            "toolbar_url", "mozac_browser_toolbar_url_view", "mozac_browser_toolbar_url_edit",
++            "mozac_browser_toolbar_url", "url_text", "url_field", "address_bar"
++        ).any { part -> last == part || last.startsWith("${part}_") || last.endsWith("_${part}") }
++        if (addressId) return true
++
++        // On some Firefox builds the address is an unlabeled text/control child
++        // of the Mozac toolbar, but not a tab-strip or an offscreen URL preview.
++        val value = (node.text?.toString().orEmpty() + " " +
++            node.contentDescription?.toString().orEmpty())
++        if (!value.contains("halocard.co", true)) return false
++        if (!node.isClickable && !node.isEditable) return false
++        var parent = node.parent
++        var levels = 0
++        while (parent != null && levels++ < 5) {
++            val id = parent.viewIdResourceName?.lowercase(Locale.ROOT).orEmpty()
++            val next = parent.parent
++            if (id.contains("tab") && !id.contains("toolbar")) {
++                parent.recycle()
++                // Parent traversal ends here; do not read other window nodes.
++                next?.recycle()
++                return false
++            }
++            if (id.contains("browser_toolbar") || id.contains("mozac_browser_toolbar") ||
++                id.contains("toolbar_layout")) {
++                parent.recycle()
++                next?.recycle()
++                return true
++            }
++            parent.recycle()
++            parent = next
++        }
++        return false
++    }
++
++    private fun isExactDashboardUrl(text: String): Boolean =
++        Regex("(?<![a-z0-9.-])(?:https?://)?secure\\.halocard\\.co/dashboard(?:[/?#]|\\b)", RegexOption.IGNORE_CASE)
++            .containsMatchIn(text.trim())
++
++    private fun isSecureHaloCardHost(text: String): Boolean =
++        Regex("(?<![a-z0-9.-])(?:https?://)?secure\\.halocard\\.co(?:[/\\s,]|$)", RegexOption.IGNORE_CASE)
++            .containsMatchIn(text.trim())
+ 
+     private fun setSiteState(show: Boolean, status: String) {
+-        val prefs = getSharedPreferences("dashboard_visibility", MODE_PRIVATE)
+-        if (prefs.getBoolean("visible", false) != show || prefs.getString("status", "") != status) {
+-            prefs.edit().putBoolean("visible", show).putString("status", status).putLong("checked_at", System.currentTimeMillis()).apply()
+-        } else {
+-            prefs.edit().putLong("checked_at", System.currentTimeMillis()).apply()
+-        }
++        getSharedPreferences("dashboard_visibility", MODE_PRIVATE).edit()
++            .putBoolean("visible", show)
++            .putString("status", status)
++            .putLong("checked_at", System.currentTimeMillis())
++            .apply()
+     }
+ }
+--- a/app/src/main/java/com/byso/halocardoverlay/BalanceCaptureService.kt
++++ b/app/src/main/java/com/byso/halocardoverlay/BalanceCaptureService.kt
+@@ -83,6 +83,11 @@
+         if (dashboard != overlayVisible) {
+             overlayVisible = dashboard
+             panel.visibility = if (dashboard) View.VISIBLE else View.GONE
++            if (dashboard) {
++                // Do not display a stale balance from the previously selected tab.
++                consecutiveMisses = 0
++                showStatus("Scanning…", "Reading current HaloCard card")
++            }
+             try { overlayParams?.let { windowManager.updateViewLayout(panel, it) } }
+             catch (_: Exception) { /* diagnostic status stays in main activity */ }
+         }
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -11,8 +11,8 @@
+         applicationId = "com.byso.halocardoverlay"
+         minSdk = 26
+         targetSdk = 35
+-        versionCode = 4
+-        versionName = "1.3"
++        versionCode = 5
++        versionName = "1.4"
+     }
+ 
+     compileOptions {
+--- a/app/src/main/res/xml/dashboard_accessibility_service.xml
++++ b/app/src/main/res/xml/dashboard_accessibility_service.xml
+@@ -1,6 +1,6 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+-    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged|typeViewTextChanged|typeWindowsChanged"
++    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged|typeViewTextChanged|typeWindowsChanged|typeViewClicked|typeViewSelected"
+     android:accessibilityFeedbackType="feedbackGeneric"
+     android:notificationTimeout="100"
+     android:canRetrieveWindowContent="true"
+
