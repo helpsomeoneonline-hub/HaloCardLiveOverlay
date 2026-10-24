@@ -1,0 +1,43 @@
+name: Build HaloCard Overlay APK
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore Android source
+        run: |
+          base64 --decode app-source.b64 > app-source.zip
+          unzip -oq app-source.zip
+          test -f app/build.gradle.kts
+          test -f app/src/main/AndroidManifest.xml
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+      - name: Install Android SDK
+        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+      - name: Build debug APK
+        run: gradle --no-daemon --stacktrace :app:assembleDebug
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HaloCard-Live-Overlay-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+      - name: Publish APK download
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create v1.0.0 "app/build/outputs/apk/debug/app-debug.apk#HaloCardLiveOverlay-v1.0.apk" --title "HaloCard Live Overlay 1.0" --notes "First test version. Android debug-signed APK; later updates may require uninstall unless a stable signing key is configured." --target "$GITHUB_SHA" || gh release upload v1.0.0 "app/build/outputs/apk/debug/app-debug.apk#HaloCardLiveOverlay-v1.0.apk" --clobber
