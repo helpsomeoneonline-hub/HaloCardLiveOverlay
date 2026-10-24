@@ -23,12 +23,6 @@ jobs:
           base64 --decode patches/halocard-v1.2.patch.xz.b64 | xz -dc | patch -p1
           test -f app/src/main/java/com/byso/halocardoverlay/DashboardAccessibilityService.kt
           grep -q 'versionCode = 3' app/build.gradle.kts
-      - name: Apply v1.1 display and auto-refresh fixes
-        run: |
-          base64 --decode upgrade-v1.1.patch.xz.b64 | xz -dc > upgrade-v1.1.patch
-          patch -p1 --batch < upgrade-v1.1.patch
-          grep -q 'versionCode = 2' app/build.gradle.kts
-          test -f app/src/main/java/com/byso/halocardoverlay/DashboardAccessibilityService.kt
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -54,4 +48,4 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create v1.1.0 "app/build/outputs/apk/debug/app-debug.apk#HaloCardLiveOverlay-v1.1.apk" --title "HaloCard Live Overlay 1.1" --notes "Version 1.1: dashboard-only overlay, continuous refresh, and draggable saved position. Debug signed: previous v1.0 may need uninstall because GitHub runners use different debug keys. Enable the new Accessibility permission for Chrome URL detection." --target "$GITHUB_SHA" || gh release upload v1.1.0 "app/build/outputs/apk/debug/app-debug.apk#HaloCardLiveOverlay-v1.1.apk" --clobber
+          gh release create v1.2.0 "app/build/outputs/apk/debug/app-debug.apk#HaloCardLiveOverlay-v1.2.apk" --title "HaloCard Live Overlay 1.2" --notes "Dashboard-only visibility and Chrome URL recovery; draggable overlay; on-device diagnostics. Debug signed: older builds may need uninstall." --target "$GITHUB_SHA" || gh release upload v1.2.0 "app/build/outputs/apk/debug/app-debug.apk#HaloCardLiveOverlay-v1.2.apk" --clobber
