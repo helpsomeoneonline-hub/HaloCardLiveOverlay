@@ -31,6 +31,10 @@ jobs:
         run: |
           patch --batch -p1 < patches/halocard-v1.4-active-tab.patch
           grep -q 'versionCode = 5' app/build.gradle.kts
+      - name: Apply v1.5 Firefox ANR and OCR threading fix
+        run: |
+          patch --batch -p1 < patches/halocard-v1.5-anr-hotfix.patch
+          grep -q 'versionCode = 6' app/build.gradle.kts
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -49,11 +53,11 @@ jobs:
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: HaloCard-Live-Overlay-v1.4-debug-apk
+          name: HaloCard-Live-Overlay-v1.5-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
       - name: Publish APK download
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create v1.4.0 "app/build/outputs/apk/debug/app-debug.apk#HaloCardLiveOverlay-v1.4.apk" --title "HaloCard Live Overlay 1.4" --notes "Firefox tab-only visibility: verifies current address bar, rejects inactive tabs and tab previews, hides on tab changes and off-dashboard. Also supports Chrome. Device validation still needed; debug signing can require uninstall." --target "$GITHUB_SHA" || gh release upload v1.4.0 "app/build/outputs/apk/debug/app-debug.apk#HaloCardLiveOverlay-v1.4.apk" --clobber
+          gh release create v1.5.0 "app/build/outputs/apk/debug/app-debug.apk#HaloCardLiveOverlay-v1.5.apk" --title "HaloCard Live Overlay 1.5" --notes "Firefox ANR hotfix: URL inspection and screenshot-to-OCR processing off Android main thread; bounded background node traversal, tab-only visibility, Chrome/Firefox. First device test needed. Debug-signed builds may need uninstall." --target "$GITHUB_SHA" || gh release upload v1.5.0 "app/build/outputs/apk/debug/app-debug.apk#HaloCardLiveOverlay-v1.5.apk" --clobber
