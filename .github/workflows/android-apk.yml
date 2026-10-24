@@ -40,6 +40,10 @@ jobs:
           base64 --decode patches/halocard-v1.6-diagnostics-bubble.patch.xz.b64 | xz -dc | patch -p1 --batch
           grep -q 'versionCode = 7' app/build.gradle.kts
           test -f app/src/main/java/com/byso/halocardoverlay/Diagnostics.kt
+      - name: Fix Firefox blinking and update version to 1.7
+        run: |
+          python3 .github/scripts/fix_overlay_blink_v17.py
+          grep -q 'versionCode = 8' app/build.gradle.kts
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -76,7 +80,7 @@ jobs:
       - name: Upload built APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: HaloCard-Live-Overlay-v1.6-apk
+          name: HaloCard-Live-Overlay-v1.7-apk
           path: ${{ steps.buildapk.outputs.apk }}
           if-no-files-found: error
       - name: Publish permanently signed APK
@@ -84,10 +88,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create v1.6.0 "app/build/outputs/apk/release/app-release.apk#HaloCardLiveOverlay-v1.6.apk" --title "HaloCard Live Overlay 1.6" --notes "Permanent signing enabled. Compact expandable balance bubble and on-device diagnostics with export. Same applicationId and increasing versionCode allow in-place future upgrades signed with this keystore." --target "$GITHUB_SHA" || gh release upload v1.6.0 "app/build/outputs/apk/release/app-release.apk#HaloCardLiveOverlay-v1.6.apk" --clobber
+          gh release create v1.7.0 "app/build/outputs/apk/release/app-release.apk#HaloCardLiveOverlay-v1.7.apk" --title "HaloCard Live Overlay 1.7" --notes "Permanently signed build. Fixes self-triggered Firefox overlay blinking by ignoring overlay-origin accessibility events and not hiding for unrelated Firefox window-change events. Includes v1.6 diagnostics and compact bubble." --target "$GITHUB_SHA" || gh release upload v1.7.0 "app/build/outputs/apk/release/app-release.apk#HaloCardLiveOverlay-v1.7.apk" --clobber
       - name: Publish temporary debug preview
         if: steps.buildapk.outputs.stable != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create v1.6.0-preview "app/build/outputs/apk/debug/app-debug.apk#HaloCardLiveOverlay-v1.6-PREVIEW.apk" --title "HaloCard Live Overlay v1.6 Preview (temporary key)" --notes "PREVIEW ONLY: Uses temporary GitHub debug signing. To avoid another uninstall, configure HALOCARD_SIGNING_BUNDLE_B64 in repository Actions secrets and rerun the workflow to get the permanent-signed v1.6.0 release." --target "$GITHUB_SHA" || gh release upload v1.6.0-preview "app/build/outputs/apk/debug/app-debug.apk#HaloCardLiveOverlay-v1.6-PREVIEW.apk" --clobber
+          gh release create v1.7.0-preview "app/build/outputs/apk/debug/app-debug.apk#HaloCardLiveOverlay-v1.7-PREVIEW.apk" --title "HaloCard Live Overlay v1.7 Preview (temporary key)" --notes "PREVIEW ONLY: Uses temporary GitHub debug signing. To avoid another uninstall, configure HALOCARD_SIGNING_BUNDLE_B64 in repository Actions secrets and rerun the workflow to get the permanent-signed v1.6.0 release." --target "$GITHUB_SHA" || gh release upload v1.6.0-preview "app/build/outputs/apk/debug/app-debug.apk#HaloCardLiveOverlay-v1.7-PREVIEW.apk" --clobber
