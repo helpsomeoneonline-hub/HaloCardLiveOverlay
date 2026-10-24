@@ -60,7 +60,32 @@ jobs:
         run: |
           if [ -n "$HALOCARD_SIGNING_BUNDLE_B64" ]; then
             mkdir -p "$RUNNER_TEMP/halocard-signing"
-            printf "%s" "$HALOCARD_SIGNING_BUNDLE_B64" | base64 --decode | tar -xz -C "$RUNNER_TEMP/halocard-signing"
+            python3 - <<'PY'
+            import os, re, base64, io, tarfile, pathlib, sys
+            raw = os.environ["HALOCARD_SIGNING_BUNDLE_B64"]
+            candidates = ["".join(raw.split()).strip("'\\"`")]
+            candidates += re.findall(r"[A-Za-z0-9+/]{128,}={0,2}", raw)
+            output = pathlib.Path(os.environ["RUNNER_TEMP"]) / "halocard-signing"
+            valid = False
+            for item in candidates:
+                try:
+                    data = base64.b64decode(item, validate=True)
+                    if not data.startswith(b"\\x1f\\x8b"):
+                        continue
+                    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
+                        for name in ("halocard-release.jks", "signing-pass.txt"):
+                            entry = archive.extractfile(name)
+                            if entry is None:
+                                raise ValueError("missing signing file")
+                            (output / name).write_bytes(entry.read())
+                    valid = True
+                    break
+                except (ValueError, OSError, tarfile.TarError, KeyError):
+                    continue
+            if not valid:
+                sys.exit("SIGNING_SECRET_INVALID: Open GitHub Actions secrets and replace HALOCARD_SIGNING_BUNDLE_B64 with the COMPLETE contents of HaloCard_GitHub_Secret_Value.txt (plain text only).")
+            print("Permanent signing archive decoded and signing files located.")
+            PY
             export HALOCARD_KEYSTORE_PATH="$RUNNER_TEMP/halocard-signing/halocard-release.jks"
             export HALOCARD_STORE_PASSWORD="$(cat "$RUNNER_TEMP/halocard-signing/signing-pass.txt")"
             test -s "$HALOCARD_KEYSTORE_PATH"
