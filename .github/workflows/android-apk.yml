@@ -35,6 +35,11 @@ jobs:
         run: |
           patch --batch -p1 < patches/halocard-v1.5-anr-hotfix.patch
           grep -q 'versionCode = 6' app/build.gradle.kts
+      - name: Apply v1.6 diagnostics and compact-bubble patch
+        run: |
+          base64 --decode patches/halocard-v1.6-diagnostics-bubble.patch.xz.b64 | xz -dc | patch -p1 --batch
+          grep -q 'versionCode = 7' app/build.gradle.kts
+          test -f app/src/main/java/com/byso/halocardoverlay/Diagnostics.kt
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -48,16 +53,41 @@ jobs:
           test -x "$SDKMANAGER"
           yes | "$SDKMANAGER" --licenses > /dev/null || true
           "$SDKMANAGER" 'platforms;android-35' 'build-tools;35.0.0'
-      - name: Build debug APK
-        run: gradle --no-daemon --stacktrace :app:assembleDebug
-      - name: Upload APK artifact
+      - name: Build APK with permanent signing key when configured
+        id: buildapk
+        env:
+          HALOCARD_SIGNING_BUNDLE_B64: ${{ secrets.HALOCARD_SIGNING_BUNDLE_B64 }}
+        run: |
+          if [ -n "$HALOCARD_SIGNING_BUNDLE_B64" ]; then
+            mkdir -p "$RUNNER_TEMP/halocard-signing"
+            printf "%s" "$HALOCARD_SIGNING_BUNDLE_B64" | base64 --decode | tar -xz -C "$RUNNER_TEMP/halocard-signing"
+            export HALOCARD_KEYSTORE_PATH="$RUNNER_TEMP/halocard-signing/halocard-release.jks"
+            export HALOCARD_STORE_PASSWORD="$(cat "$RUNNER_TEMP/halocard-signing/signing-pass.txt")"
+            test -s "$HALOCARD_KEYSTORE_PATH"
+            gradle --no-daemon --stacktrace :app:assembleRelease
+            echo "stable=true" >> "$GITHUB_OUTPUT"
+            echo "apk=app/build/outputs/apk/release/app-release.apk" >> "$GITHUB_OUTPUT"
+          else
+            echo "Permanent signing secret missing. Building diagnostic preview ONLY."
+            gradle --no-daemon --stacktrace :app:assembleDebug
+            echo "stable=false" >> "$GITHUB_OUTPUT"
+            echo "apk=app/build/outputs/apk/debug/app-debug.apk" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Upload built APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: HaloCard-Live-Overlay-v1.5-debug-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: HaloCard-Live-Overlay-v1.6-apk
+          path: ${{ steps.buildapk.outputs.apk }}
           if-no-files-found: error
-      - name: Publish APK download
+      - name: Publish permanently signed APK
+        if: steps.buildapk.outputs.stable == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create v1.5.0 "app/build/outputs/apk/debug/app-debug.apk#HaloCardLiveOverlay-v1.5.apk" --title "HaloCard Live Overlay 1.5" --notes "Firefox ANR hotfix: URL inspection and screenshot-to-OCR processing off Android main thread; bounded background node traversal, tab-only visibility, Chrome/Firefox. First device test needed. Debug-signed builds may need uninstall." --target "$GITHUB_SHA" || gh release upload v1.5.0 "app/build/outputs/apk/debug/app-debug.apk#HaloCardLiveOverlay-v1.5.apk" --clobber
+          gh release create v1.6.0 "app/build/outputs/apk/release/app-release.apk#HaloCardLiveOverlay-v1.6.apk" --title "HaloCard Live Overlay 1.6" --notes "Permanent signing enabled. Compact expandable balance bubble and on-device diagnostics with export. Same applicationId and increasing versionCode allow in-place future upgrades signed with this keystore." --target "$GITHUB_SHA" || gh release upload v1.6.0 "app/build/outputs/apk/release/app-release.apk#HaloCardLiveOverlay-v1.6.apk" --clobber
+      - name: Publish temporary debug preview
+        if: steps.buildapk.outputs.stable != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create v1.6.0-preview "app/build/outputs/apk/debug/app-debug.apk#HaloCardLiveOverlay-v1.6-PREVIEW.apk" --title "HaloCard Live Overlay v1.6 Preview (temporary key)" --notes "PREVIEW ONLY: Uses temporary GitHub debug signing. To avoid another uninstall, configure HALOCARD_SIGNING_BUNDLE_B64 in repository Actions secrets and rerun the workflow to get the permanent-signed v1.6.0 release." --target "$GITHUB_SHA" || gh release upload v1.6.0-preview "app/build/outputs/apk/debug/app-debug.apk#HaloCardLiveOverlay-v1.6-PREVIEW.apk" --clobber
