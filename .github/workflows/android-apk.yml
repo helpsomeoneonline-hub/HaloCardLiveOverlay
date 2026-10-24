@@ -23,6 +23,10 @@ jobs:
           base64 --decode patches/halocard-v1.2.patch.xz.b64 | xz -dc | patch -p1
           test -f app/src/main/java/com/byso/halocardoverlay/DashboardAccessibilityService.kt
           grep -q 'versionCode = 3' app/build.gradle.kts
+      - name: Apply v1.3 Firefox compatibility patch
+        run: |
+          patch --batch -p1 < patches/halocard-v1.3-browser-support.patch
+          grep -q 'versionCode = 4' app/build.gradle.kts
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -41,11 +45,11 @@ jobs:
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: HaloCard-Live-Overlay-v1.2-debug-apk
+          name: HaloCard-Live-Overlay-v1.3-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
       - name: Publish APK download
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create v1.2.0 "app/build/outputs/apk/debug/app-debug.apk#HaloCardLiveOverlay-v1.2.apk" --title "HaloCard Live Overlay 1.2" --notes "Dashboard-only visibility and Chrome URL recovery; draggable overlay; on-device diagnostics. Debug signed: older builds may need uninstall." --target "$GITHUB_SHA" || gh release upload v1.2.0 "app/build/outputs/apk/debug/app-debug.apk#HaloCardLiveOverlay-v1.2.apk" --clobber
+          gh release create v1.3.0 "app/build/outputs/apk/debug/app-debug.apk#HaloCardLiveOverlay-v1.3.apk" --title "HaloCard Live Overlay 1.3" --notes "Adds Firefox for Android support alongside Chrome, with HaloCard dashboard-only visibility. Tablet validation still needed; debug APK signing may differ from previous versions." --target "$GITHUB_SHA" || gh release upload v1.3.0 "app/build/outputs/apk/debug/app-debug.apk#HaloCardLiveOverlay-v1.3.apk" --clobber

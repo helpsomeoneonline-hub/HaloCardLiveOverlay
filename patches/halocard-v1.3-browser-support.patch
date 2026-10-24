@@ -1,0 +1,117 @@
+--- a/app/src/main/java/com/byso/halocardoverlay/DashboardAccessibilityService.kt
++++ b/app/src/main/java/com/byso/halocardoverlay/DashboardAccessibilityService.kt
+@@ -8,10 +8,13 @@
+ import android.view.accessibility.AccessibilityNodeInfo
+ import java.util.Locale
+ 
+-/** Checks Chrome's *visible address bar*; never sends a screenshot or URL off the tablet. */
++/** Checks the active Chrome / Firefox address bar; never transmits URLs or screenshots. */
+ class DashboardAccessibilityService : AccessibilityService() {
+     private val handler = Handler(Looper.getMainLooper())
+-    private val browserPackages = setOf("com.android.chrome", "com.chrome.beta", "com.chrome.dev", "com.chrome.canary")
++    private val browserPackages = setOf(
++        "com.android.chrome", "com.chrome.beta", "com.chrome.dev", "com.chrome.canary",
++        "org.mozilla.firefox", "org.mozilla.firefox_beta", "org.mozilla.fenix"
++    )
+     private var running = false
+     private val inspectTask = object : Runnable {
+         override fun run() {
+@@ -52,7 +55,7 @@
+         try {
+             val activePackage = root.packageName?.toString().orEmpty()
+             if (activePackage !in browserPackages) {
+-                setSiteState(false, "Open dashboard in Chrome")
++                setSiteState(false, "Open HaloCard dashboard in Chrome or Firefox")
+                 return
+             }
+             val urlCandidates = ArrayList<String>()
+@@ -70,11 +73,15 @@
+                 if (text.contains("spending power", true) || description.contains("spending power", true)) dashboardText = true
+                 if (text.contains("new card", true) || text.contains("all-time limit", true)) cardsText = true
+                 if (viewId.contains("url_bar") || viewId.contains("location_bar") ||
+-                    viewId.contains("search_box_text") || viewId.contains("omnibox")) {
++                    viewId.contains("search_box_text") || viewId.contains("omnibox") ||
++                    // Firefox for Android (Fenix / GeckoView) has different URL widgets.
++                    viewId.contains("url_view") || viewId.contains("url_edit") ||
++                    viewId.contains("url_input") || viewId.contains("mozac_browser_toolbar") ||
++                    viewId.contains("display_url") || viewId.contains("edit_url")) {
+                     urlCandidates.add(text)
+                     urlCandidates.add(description)
+                 }
+-                // Chrome sometimes puts the URL in a parent's spoken description.
++                // Chrome and Firefox can expose the URL in a parent spoken description.
+                 if (text.contains("halocard.co", true) || description.contains("halocard.co", true)) {
+                     urlCandidates.add(text)
+                     urlCandidates.add(description)
+@@ -84,13 +91,13 @@
+                 }
+             }
+             val fullDashboard = urlCandidates.any { isDashboardUrl(it) }
+-            // Chrome sometimes shows only the host in the address bar until tapped.
++            // Either browser may display only the host in its collapsed address bar.
+             // In that case, require dashboard-specific controls as a second signal.
+             val hostAndDashboard = urlCandidates.any { isAllowedHostOnly(it) } && dashboardText && cardsText
+             if (fullDashboard || hostAndDashboard) {
+                 setSiteState(true, "HaloCard dashboard detected")
+             } else {
+-                setSiteState(false, if (urlCandidates.isEmpty()) "Chrome address not detected" else "Not on HaloCard dashboard")
++                setSiteState(false, if (urlCandidates.isEmpty()) "Browser address not detected" else "Not on HaloCard dashboard")
+             }
+         } finally {
+             root.recycle()
+--- a/app/src/main/java/com/byso/halocardoverlay/MainActivity.kt
++++ b/app/src/main/java/com/byso/halocardoverlay/MainActivity.kt
+@@ -67,7 +67,7 @@
+         layout.addView(actionButton("Test bubble for 8 seconds") { showTestBubble() })
+         statusText = description("Checking accessibility and capture status…")
+         layout.addView(statusText)
+-        layout.addView(description("Only secure.halocard.co/dashboard in Chrome makes the live bubble visible. Chrome's address must be detectable by Accessibility. If the bubble does not appear, read the live diagnostics above.\n\nUsage: Allow the floating window, tap Start, grant Android's screen-sharing permission, and return to HaloCard in Chrome. The overlay checks roughly every 1.5 seconds and updates when you switch cards. Tap the overlay's close button or Stop here to end.\n\nAndroid may ask again when you start a new capture session; it does not ask for every new card."))
++        layout.addView(description("Only secure.halocard.co/dashboard in Chrome or Firefox makes the live bubble visible. The browser address must be detectable by Accessibility. If the bubble does not appear, read the live diagnostics above.\n\nUsage: Allow the floating window, tap Start, grant Android's screen-sharing permission, and return to HaloCard in Chrome or Firefox. The overlay checks roughly every 1.5 seconds and updates when you switch cards. Tap the overlay's close button or Stop here to end.\n\nAndroid may ask again when you start a new capture session; it does not ask for every new card."))
+         setContentView(layout)
+         if (Build.VERSION.SDK_INT >= 33 &&
+             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
+@@ -154,9 +154,9 @@
+         val recent = last > 0 && System.currentTimeMillis() - last < 3000
+         statusText.text = "Overlay permission: ${if (Settings.canDrawOverlays(this)) "OK" else "NOT ALLOWED"}\n" +
+             "Accessibility service: ${if (enabled) "ON" else "OFF"}\n" +
+-            "Website detection: ${if (recent) visible.getString("status", "Unknown") else "No recent Chrome check"}\n" +
++            "Website detection: ${if (recent) visible.getString("status", "Unknown") else "No recent browser check"}\n" +
+             "Capture: ${capture.getString("status", "Not started")}" +
+-            "\n\nIf you are on the dashboard and it says Chrome address not detected, report that message."
++            "\n\nIf you are on the dashboard and it says Browser address not detected, report that message."
+     }
+ 
+     private fun showTestBubble() {
+--- a/app/src/main/java/com/byso/halocardoverlay/BalanceCaptureService.kt
++++ b/app/src/main/java/com/byso/halocardoverlay/BalanceCaptureService.kt
+@@ -247,7 +247,7 @@
+             image.close()
+         }
+ 
+-        // No reason to scan other sites or the Chrome address bar when not on the dashboard.
++        // No reason to scan other sites or the browser address bar when not on the dashboard.
+         if (!overlayVisible) { bitmap.recycle(); return }
+         scanning = true
+         recognizer.process(InputImage.fromBitmap(bitmap, 0))
+@@ -353,7 +353,7 @@
+         }
+         panel.addView(balanceLabel)
+         detailLabel = TextView(this).apply {
+-            text = "Switch to HaloCard in Chrome"
++            text = "Open HaloCard in Chrome or Firefox"
+             textSize = 11f
+             setTextColor(Color.rgb(208, 220, 226))
+         }
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -11,8 +11,8 @@
+         applicationId = "com.byso.halocardoverlay"
+         minSdk = 26
+         targetSdk = 35
+-        versionCode = 3
+-        versionName = "1.2"
++        versionCode = 4
++        versionName = "1.3"
+     }
+ 
+     compileOptions {
