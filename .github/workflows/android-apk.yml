@@ -44,6 +44,16 @@ jobs:
         run: |
           python3 .github/scripts/fix_overlay_blink_v17.py
           grep -q 'versionCode = 8' app/build.gradle.kts
+      - name: Upload source snapshot for Firefox diagnosis
+        uses: actions/upload-artifact@v4
+        with:
+          name: HaloCard-v1.7-reconstructed-source
+          path: |
+            app/src/main/java/com/byso/halocardoverlay/
+            app/src/main/AndroidManifest.xml
+            app/src/main/res/xml/dashboard_accessibility_service.xml
+            app/build.gradle.kts
+          if-no-files-found: error
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
