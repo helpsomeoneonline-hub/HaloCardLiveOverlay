@@ -18,6 +18,11 @@ jobs:
           unzip -oq app-source.zip
           test -f app/build.gradle.kts
           test -f app/src/main/AndroidManifest.xml
+      - name: Apply v1.2 overlay visibility fix
+        run: |
+          base64 --decode patches/halocard-v1.2.patch.xz.b64 | xz -dc | patch -p1
+          test -f app/src/main/java/com/byso/halocardoverlay/DashboardAccessibilityService.kt
+          grep -q 'versionCode = 3' app/build.gradle.kts
       - name: Apply v1.1 display and auto-refresh fixes
         run: |
           base64 --decode upgrade-v1.1.patch.xz.b64 | xz -dc > upgrade-v1.1.patch
@@ -42,7 +47,7 @@ jobs:
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: HaloCard-Live-Overlay-debug-apk
+          name: HaloCard-Live-Overlay-v1.2-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
       - name: Publish APK download
