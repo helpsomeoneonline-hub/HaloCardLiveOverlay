@@ -53,10 +53,15 @@ jobs:
           base64 --decode patches/halocard-v1.9-firefox-diagnostics.patch.xz.b64 | xz -dc | patch --batch -p1
           grep -q 'versionCode = 10' app/build.gradle.kts
           grep -q 'fun verifyFirefoxFrame' app/src/main/java/com/byso/halocardoverlay/BalanceCaptureService.kt
+      - name: Validate card limit OCR and confirm two frames for v2.0
+        run: |
+          python3 .github/scripts/fix_card_amount_v20.py
+          grep -q 'versionCode = 11' app/build.gradle.kts
+          grep -q 'repeatedBalanceFrames >= 2' app/src/main/java/com/byso/halocardoverlay/BalanceCaptureService.kt
       - name: Upload source snapshot for Firefox diagnosis
         uses: actions/upload-artifact@v4
         with:
-          name: HaloCard-v1.9-reconstructed-source
+          name: HaloCard-v2.0-reconstructed-source
           path: |
             app/src/main/java/com/byso/halocardoverlay/
             app/src/main/AndroidManifest.xml
@@ -99,7 +104,7 @@ jobs:
       - name: Upload built APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: HaloCard-Live-Overlay-v1.9-apk
+          name: HaloCard-Live-Overlay-v2.0-apk
           path: ${{ steps.buildapk.outputs.apk }}
           if-no-files-found: error
       - name: Publish permanently signed APK
@@ -107,10 +112,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create v1.9.0 "app/build/outputs/apk/release/app-release.apk#HaloCardLiveOverlay-v1.9.apk" --title "HaloCard Live Overlay 1.9" --notes "Permanently signed update: Firefox on-screen dashboard verification fallback, tab-sensitive visibility, more diagnostics, and direct log export to Downloads or clipboard. Chrome unchanged. Needs user-device testing." --target "$GITHUB_SHA" || gh release upload v1.9.0 "app/build/outputs/apk/release/app-release.apk#HaloCardLiveOverlay-v1.9.apk" --clobber
+          gh release create v2.0.0 "app/build/outputs/apk/release/app-release.apk#HaloCardLiveOverlay-v2.0.apk" --title "HaloCard Live Overlay 2.0" --notes "Permanently signed. Rejects OCR readings when the spent amount exceeds a recognized card limit, and confirms the card figures across two consecutive captures before updating. Chrome and Firefox behavior preserved." --target "$GITHUB_SHA" || gh release upload v2.0.0 "app/build/outputs/apk/release/app-release.apk#HaloCardLiveOverlay-v2.0.apk" --clobber
       - name: Publish temporary debug preview
         if: steps.buildapk.outputs.stable != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create v1.9.0-preview "app/build/outputs/apk/debug/app-debug.apk#HaloCardLiveOverlay-v1.9-PREVIEW.apk" --title "HaloCard Live Overlay 1.9 Preview" --notes "Temporary key: not installable as an upgrade to signed release." --target "$GITHUB_SHA" || gh release upload v1.9.0-preview "app/build/outputs/apk/debug/app-debug.apk#HaloCardLiveOverlay-v1.9-PREVIEW.apk" --clobber
+          gh release create v2.0.0-preview "app/build/outputs/apk/debug/app-debug.apk#HaloCardLiveOverlay-v2.0-PREVIEW.apk" --title "HaloCard Live Overlay 2.0 Preview" --notes "Debug-signed preview; not an upgrade to permanent release." --target "$GITHUB_SHA" || gh release upload v2.0.0-preview "app/build/outputs/apk/debug/app-debug.apk#HaloCardLiveOverlay-v2.0-PREVIEW.apk" --clobber
