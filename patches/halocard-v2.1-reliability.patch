@@ -14,18 +14,26 @@ index 8541962..b55c90a 100644
  
      signingConfigs {
 diff --git a/app/src/main/java/com/byso/halocardoverlay/BalanceCaptureService.kt b/app/src/main/java/com/byso/halocardoverlay/BalanceCaptureService.kt
-index b144f48..df14254 100644
+index b144f48..e460273 100644
 --- a/app/src/main/java/com/byso/halocardoverlay/BalanceCaptureService.kt
 +++ b/app/src/main/java/com/byso/halocardoverlay/BalanceCaptureService.kt
-@@ -49,6 +49,7 @@ class BalanceCaptureService : Service() {
+@@ -49,6 +49,15 @@ class BalanceCaptureService : Service() {
          private const val CHANNEL_ID = "halocard_live_balance"
          private const val NOTIFICATION_ID = 624
          private const val POLL_MS = 1250L
++        // Faster checks while a new card's figures are still being confirmed.
++        private const val FAST_POLL_MS = 550L
++        // Large tablet frames are shrunk before OCR; text stays well above
++        // ML Kit's minimum size and recognition is much cheaper.
++        private const val MAX_OCR_SIDE = 1920
++        /** True while capture runs; the accessibility check idles otherwise. */
++        @Volatile var isRunning = false
++            private set
 +        private const val HIDE_GRACE_MS = 1600L
      }
  
      private val mainHandler = Handler(Looper.getMainLooper())
-@@ -70,6 +71,12 @@ class BalanceCaptureService : Service() {
+@@ -70,6 +79,18 @@ class BalanceCaptureService : Service() {
      @Volatile private var scanning = false
      @Volatile private var destroyed = false
      @Volatile private var overlayVisible = false
@@ -35,10 +43,16 @@ index b144f48..df14254 100644
 +    // last frame so a still dashboard is still read (previously it could stay
 +    // stuck on 'Scanning…'/'Verifying…' and Firefox could hide the bubble).
 +    @Volatile private var lastFrame: Bitmap? = null
++    // OCR text for lastFrame, plus a cheap pixel fingerprint of it. A frame whose
++    // fingerprint hasn't changed (cursor blink, status-bar clock) reuses the text
++    // instead of running text recognition again.
++    @Volatile private var lastFrameText: String? = null
++    private var lastFingerprint = 0L
++    @Volatile private var needsFastPoll = true
      private val visibilityRunnable = object : Runnable {
          override fun run() {
              if (destroyed) return
-@@ -86,7 +93,12 @@ class BalanceCaptureService : Service() {
+@@ -86,7 +107,12 @@ class BalanceCaptureService : Service() {
          val visualVerified = firefoxActive() &&
              visual.getBoolean("confirmed", false) &&
              System.currentTimeMillis() - visual.getLong("last_frame_at", 0) in 0L..3200L
@@ -52,7 +66,15 @@ index b144f48..df14254 100644
          val panel = overlay ?: return
          if (dashboard != overlayVisible) {
              Diagnostics.record(this, "Overlay", if (dashboard) "Showing on confirmed HaloCard dashboard" else "Hidden outside confirmed dashboard")
-@@ -155,7 +167,12 @@ class BalanceCaptureService : Service() {
+@@ -98,6 +124,7 @@ class BalanceCaptureService : Service() {
+                 pendingBalance = null
+                 repeatedBalanceFrames = 0
+                 publishedBalance = null
++                needsFastPoll = true
+                 showStatus("Scanning…", "Reading current HaloCard card")
+             }
+             try { overlayParams?.let { windowManager.updateViewLayout(panel, it) } }
+@@ -155,7 +182,12 @@ class BalanceCaptureService : Service() {
      }
      private val captureCallback = object : MediaProjection.Callback() {
          override fun onStop() {
@@ -66,7 +88,16 @@ index b144f48..df14254 100644
              stopSelf()
          }
  
-@@ -179,6 +196,7 @@ class BalanceCaptureService : Service() {
+@@ -170,7 +202,7 @@ class BalanceCaptureService : Service() {
+         override fun run() {
+             if (destroyed) return
+             if (!scanning) scanFrame()
+-            scanHandler.postDelayed(this, POLL_MS)
++            scanHandler.postDelayed(this, if (needsFastPoll) FAST_POLL_MS else POLL_MS)
+         }
+     }
+ 
+@@ -179,6 +211,7 @@ class BalanceCaptureService : Service() {
      override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
          when (intent?.action) {
              ACTION_STOP -> {
@@ -74,7 +105,15 @@ index b144f48..df14254 100644
                  stopSelf()
                  return START_NOT_STICKY
              }
-@@ -223,6 +241,23 @@ class BalanceCaptureService : Service() {
+@@ -205,6 +238,7 @@ class BalanceCaptureService : Service() {
+                     val result = manager.getMediaProjection(resultCode, data)
+                         ?: throw IllegalStateException("Screen capture was not permitted")
+                     projection = result
++                    isRunning = true
+                     result.registerCallback(captureCallback, mainHandler)
+                     showOverlay()
+                     refreshDashboardVisibility()
+@@ -223,6 +257,23 @@ class BalanceCaptureService : Service() {
          return START_NOT_STICKY
      }
  
@@ -98,14 +137,16 @@ index b144f48..df14254 100644
      private fun createNotificationChannel() {
          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
              val manager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-@@ -295,7 +330,14 @@ class BalanceCaptureService : Service() {
+@@ -295,7 +346,16 @@ class BalanceCaptureService : Service() {
      private fun scanFrame() {
          if (destroyed || (!overlayVisible && !firefoxActive())) return
          val reader = imageReader ?: return
 -        val image = try { reader.acquireLatestImage() } catch (_: Exception) { null } ?: return
 +        val image = try { reader.acquireLatestImage() } catch (_: Exception) { null }
 +        if (image == null) {
-+            // Screen hasn't changed: re-read the last frame instead of skipping.
++            // Screen hasn't changed: reuse what was already read from it.
++            val text = lastFrameText
++            if (text != null) { mainHandler.post { handleText(text) }; return }
 +            val cached = lastFrame ?: return
 +            if (cached.isRecycled) return
 +            runOcr(cached)
@@ -114,13 +155,40 @@ index b144f48..df14254 100644
          val bitmap = try {
              val plane = image.planes.first()
              val buffer = plane.buffer
-@@ -316,8 +358,16 @@ class BalanceCaptureService : Service() {
+@@ -307,55 +367,67 @@ class BalanceCaptureService : Service() {
+             val paddedWidth = width + (stride - pixelStride * width) / pixelStride
+             val paddedBitmap = Bitmap.createBitmap(paddedWidth, height, Bitmap.Config.ARGB_8888)
+             paddedBitmap.copyPixelsFromBuffer(buffer)
+-            val clipped = Bitmap.createBitmap(paddedBitmap, 0, 0, width, height)
+-            if (clipped !== paddedBitmap) paddedBitmap.recycle()
+-            clipped
++            // One step: drop row padding and shrink oversized frames together.
++            val scale = minOf(1f, MAX_OCR_SIDE.toFloat() / maxOf(width, height))
++            val result = if (paddedWidth == width && scale >= 1f) paddedBitmap else {
++                val m = android.graphics.Matrix().apply { if (scale < 1f) setScale(scale, scale) }
++                Bitmap.createBitmap(paddedBitmap, 0, 0, width, height, m, true)
++            }
++            if (result !== paddedBitmap) paddedBitmap.recycle()
++            result
+         } catch (_: Exception) {
+             return
+         } finally {
              image.close()
          }
  
++        val fingerprint = fingerprint(bitmap)
++        val text = lastFrameText
++        if (text != null && fingerprint == lastFingerprint) {
++            // Visually identical to the frame already read: skip OCR.
++            bitmap.recycle()
++            mainHandler.post { handleText(text) }
++            return
++        }
 +        // scanFrame only runs when no OCR is in progress, so the old frame is free.
 +        val previous = lastFrame
 +        lastFrame = bitmap
++        lastFrameText = null
++        lastFingerprint = fingerprint
 +        if (previous != null && previous !== bitmap && !previous.isRecycled) previous.recycle()
          // No reason to scan other sites or the browser address bar when not on the dashboard.
 -        if (!overlayVisible && !firefoxActive()) { bitmap.recycle(); return }
@@ -128,11 +196,67 @@ index b144f48..df14254 100644
 +        runOcr(bitmap)
 +    }
 +
++    /** Samples a 48x48 grid of pixels below the status bar; enough to notice any real page change. */
++    private fun fingerprint(bitmap: Bitmap): Long {
++        val w = bitmap.width
++        val h = bitmap.height
++        val top = (h * 0.05f).toInt() // skip the status-bar clock and icons
++        var hash = 1125899906842597L
++        for (gy in 0 until 48) {
++            val y = top + (h - top - 1) * gy / 47
++            for (gx in 0 until 48) {
++                hash = 31 * hash + bitmap.getPixel((w - 1) * gx / 47, y)
++            }
++        }
++        return hash
++    }
++
 +    private fun runOcr(bitmap: Bitmap) {
          scanning = true
          recognizer.process(InputImage.fromBitmap(bitmap, 0))
              .addOnSuccessListener { result ->
-@@ -363,7 +413,6 @@ class BalanceCaptureService : Service() {
+                 if (destroyed) return@addOnSuccessListener
+-                val match = CardBalanceParser.parse(result.text)
+-                if (firefoxActive()) verifyFirefoxFrame(result.text, match != null)
+-                if (match != null) {
+-                    if (consecutiveMisses > 2) Diagnostics.record(this, "OCR", "Card balance recognized after previous misses")
+-                    consecutiveMisses = 0
+-                    if (sameAmounts(pendingBalance, match)) {
+-                        repeatedBalanceFrames++
+-                    } else {
+-                        pendingBalance = match
+-                        repeatedBalanceFrames = 1
+-                        // Clear stale figures immediately while verifying another card.
+-                        if (!sameAmounts(publishedBalance, match)) {
+-                            showStatus("Verifying…", "Confirming current card figures")
+-                        }
+-                    }
+-                    if (repeatedBalanceFrames >= 2 && !sameAmounts(publishedBalance, match)) {
+-                        publishedBalance = match
+-                        showBalance(match)
+-                    }
+-                } else {
+-                    consecutiveMisses++
+-                    pendingBalance = null
+-                    repeatedBalanceFrames = 0
+-                    if (consecutiveMisses == 3) {
+-                        publishedBalance = null
+-                        Diagnostics.record(this, "OCR", "Three captures without a matching reliable card amount")
+-                        showStatus("—", "Waiting for a clear 'spent of limit' reading")
+-                    }
+-                }
++                if (bitmap === lastFrame) lastFrameText = result.text
++                handleText(result.text)
+             }
+             .addOnFailureListener {
+                 consecutiveMisses++
+                 pendingBalance = null
+                 repeatedBalanceFrames = 0
++                needsFastPoll = true
+                 if (consecutiveMisses == 3) {
+                     publishedBalance = null
+                     Diagnostics.record(this, "OCR", "Text recognition failed three times")
+@@ -363,11 +435,48 @@ class BalanceCaptureService : Service() {
                  }
              }
              .addOnCompleteListener {
@@ -140,7 +264,49 @@ index b144f48..df14254 100644
                  scanning = false
              }
      }
-@@ -424,7 +473,7 @@ class BalanceCaptureService : Service() {
+ 
++    /** Runs on the main thread with text from a fresh OCR or an unchanged frame. */
++    private fun handleText(text: String) {
++        if (destroyed) return
++        val match = CardBalanceParser.parse(text)
++        if (firefoxActive()) verifyFirefoxFrame(text, match != null)
++        if (match != null) {
++            if (consecutiveMisses > 2) Diagnostics.record(this, "OCR", "Card balance recognized after previous misses")
++            consecutiveMisses = 0
++            if (sameAmounts(pendingBalance, match)) {
++                repeatedBalanceFrames++
++            } else {
++                pendingBalance = match
++                repeatedBalanceFrames = 1
++                // Clear stale figures immediately while verifying another card.
++                if (!sameAmounts(publishedBalance, match)) {
++                    showStatus("Verifying…", "Confirming current card figures")
++                }
++            }
++            if (repeatedBalanceFrames >= 2 && !sameAmounts(publishedBalance, match)) {
++                publishedBalance = match
++                showBalance(match)
++            }
++        } else {
++            consecutiveMisses++
++            pendingBalance = null
++            repeatedBalanceFrames = 0
++            if (consecutiveMisses == 3) {
++                publishedBalance = null
++                Diagnostics.record(this, "OCR", "Three captures without a matching reliable card amount")
++                showStatus("—", "Waiting for a clear 'spent of limit' reading")
++            }
++        }
++        // Poll quickly until the current card's figures are confirmed.
++        // Slow down again once confirmed, or when no card is on screen.
++        needsFastPoll = if (match != null) !sameAmounts(publishedBalance, match)
++            else consecutiveMisses < 3
++    }
++
+     private fun showBalance(card: BalanceAmounts) {
+         val remaining = card.limit.subtract(card.spent)
+         val number = remaining.setScale(2, RoundingMode.HALF_UP)
+@@ -424,7 +533,7 @@ class BalanceCaptureService : Service() {
              setTextColor(Color.rgb(255, 190, 190))
              gravity = Gravity.CENTER
              contentDescription = "Stop HaloCard scanning"
@@ -149,7 +315,15 @@ index b144f48..df14254 100644
          }
          header.addView(close, LinearLayout.LayoutParams(dp(32), dp(32)))
          panel.addView(header)
-@@ -548,6 +597,7 @@ class BalanceCaptureService : Service() {
+@@ -534,6 +643,7 @@ class BalanceCaptureService : Service() {
+ 
+     override fun onDestroy() {
+         destroyed = true
++        isRunning = false
+         Diagnostics.record(this, "Capture", "Capture service stopped")
+         getSharedPreferences("overlay_runtime", MODE_PRIVATE).edit().putString("status", "Stopped").apply()
+         scanHandler.removeCallbacks(scanRunnable)
+@@ -548,6 +658,7 @@ class BalanceCaptureService : Service() {
          virtualDisplay = null
          imageReader = null
          overlay = null
@@ -158,7 +332,7 @@ index b144f48..df14254 100644
          val prefs = getSharedPreferences("capture_status", MODE_PRIVATE)
          if (!prefs.getString("status", "").orEmpty().startsWith("Capture failed")) {
 diff --git a/app/src/main/java/com/byso/halocardoverlay/DashboardAccessibilityService.kt b/app/src/main/java/com/byso/halocardoverlay/DashboardAccessibilityService.kt
-index 7595bba..2d9802b 100644
+index 7595bba..4c553a8 100644
 --- a/app/src/main/java/com/byso/halocardoverlay/DashboardAccessibilityService.kt
 +++ b/app/src/main/java/com/byso/halocardoverlay/DashboardAccessibilityService.kt
 @@ -41,6 +41,10 @@ class DashboardAccessibilityService : AccessibilityService() {
@@ -172,7 +346,15 @@ index 7595bba..2d9802b 100644
  
      private val periodic = object : Runnable {
          override fun run() {
-@@ -72,14 +76,14 @@ class DashboardAccessibilityService : AccessibilityService() {
+@@ -65,21 +69,21 @@ class DashboardAccessibilityService : AccessibilityService() {
+     }
+ 
+     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+-        if (!running || event == null) return
++        if (!running || event == null || !BalanceCaptureService.isRunning) return
+         val pkg = event.packageName?.toString().orEmpty()
+         // No event.source access here: on Firefox that binder call can block
+         // the main thread and cause a system "app isn't responding" dialog.
          if (pkg == packageName || pkg.isBlank()) return
          if (pkg in browsers) markForeground(pkg)
          if (pkg !in browsers) {
@@ -193,7 +375,16 @@ index 7595bba..2d9802b 100644
              }
              return
          }
-@@ -123,11 +127,14 @@ class DashboardAccessibilityService : AccessibilityService() {
+@@ -114,6 +118,8 @@ class DashboardAccessibilityService : AccessibilityService() {
+     }
+ 
+     private fun inspectSafely() {
++        // Don't walk browser pages while balance detection is switched off.
++        if (!BalanceCaptureService.isRunning) return
+         try { inspectActiveWindow() }
+         catch (ex: Exception) {
+             Diagnostics.record(this, "Accessibility", "Browser check error: ${ex.javaClass.simpleName}")
+@@ -123,11 +129,14 @@ class DashboardAccessibilityService : AccessibilityService() {
  
      private fun inspectActiveWindow() {
          if (SystemClock.elapsedRealtime() < tabTransitionUntil) {
@@ -209,7 +400,7 @@ index 7595bba..2d9802b 100644
              return
          }
          val queue = ArrayDeque<AccessibilityNodeInfo>()
-@@ -138,11 +145,13 @@ class DashboardAccessibilityService : AccessibilityService() {
+@@ -138,11 +147,13 @@ class DashboardAccessibilityService : AccessibilityService() {
          var cardsText = false
          var tabTrayOpen = false
          var isFirefox = false
@@ -223,7 +414,7 @@ index 7595bba..2d9802b 100644
                  setState(false, "Outside supported browser")
                  return
              }
-@@ -152,8 +161,8 @@ class DashboardAccessibilityService : AccessibilityService() {
+@@ -152,8 +163,8 @@ class DashboardAccessibilityService : AccessibilityService() {
              // GeckoView can take considerably longer to expose toolbar nodes
              // than Chrome. This entire scan runs on HaloCardBrowserCheck,
              // never the Android UI thread.
@@ -234,7 +425,7 @@ index 7595bba..2d9802b 100644
              while (queue.isNotEmpty() && visited < maximumNodes &&
                     SystemClock.elapsedRealtime() - start < maximumMs) {
                  val node = queue.removeFirst()
-@@ -171,10 +180,12 @@ class DashboardAccessibilityService : AccessibilityService() {
+@@ -171,10 +182,12 @@ class DashboardAccessibilityService : AccessibilityService() {
                      if (content.contains("spending power", true) || description.contains("spending power", true)) dashboardText = true
                      if (content.contains("new card", true) || content.contains("all-time limit", true)) cardsText = true
                      if (isAddressNode(node, id)) {
@@ -248,7 +439,7 @@ index 7595bba..2d9802b 100644
                      for (i in 0 until node.childCount) {
                          node.getChild(i)?.let { queue.add(it) }
                      }
-@@ -189,13 +200,23 @@ class DashboardAccessibilityService : AccessibilityService() {
+@@ -189,13 +202,23 @@ class DashboardAccessibilityService : AccessibilityService() {
              getSharedPreferences("dashboard_visibility", MODE_PRIVATE).edit()
                  .putBoolean("tab_tray_open", tabTrayOpen).apply()
              if (tabTrayOpen) {
@@ -276,7 +467,7 @@ index 7595bba..2d9802b 100644
              }
          } finally {
              // Recycle queued, unvisited nodes too; do not recycle root twice.
-@@ -203,6 +224,23 @@ class DashboardAccessibilityService : AccessibilityService() {
+@@ -203,6 +226,23 @@ class DashboardAccessibilityService : AccessibilityService() {
          }
      }
  

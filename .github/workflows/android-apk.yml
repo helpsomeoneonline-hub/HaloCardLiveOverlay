@@ -117,7 +117,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create v2.1.0 "app/build/outputs/apk/release/app-release.apk#HaloCardLiveOverlay-v2.1.apk" --title "HaloCard Live Overlay 2.1" --notes "Reliability update: reads the balance even when the screen is still, no bubble flicker from keyboard or system windows, stays visible when Chrome hides its address bar while scrolling, and notifies you if Android stops screen sharing." --target "$GITHUB_SHA" || gh release upload v2.1.0 "app/build/outputs/apk/release/app-release.apk#HaloCardLiveOverlay-v2.1.apk" --clobber
+          gh release create v2.1.0 "app/build/outputs/apk/release/app-release.apk#HaloCardLiveOverlay-v2.1.apk" --title "HaloCard Live Overlay 2.1" --notes "Reliability update: reads the balance even when the screen is still, no bubble flicker from keyboard or system windows, stays visible when Chrome hides its address bar while scrolling, notifies you if Android stops screen sharing, shows a new card's balance faster, and skips repeat text recognition on unchanged screens to save battery." --target "$GITHUB_SHA" || gh release upload v2.1.0 "app/build/outputs/apk/release/app-release.apk#HaloCardLiveOverlay-v2.1.apk" --clobber
       - name: Publish temporary debug preview
         if: steps.buildapk.outputs.stable != 'true'
         env:
