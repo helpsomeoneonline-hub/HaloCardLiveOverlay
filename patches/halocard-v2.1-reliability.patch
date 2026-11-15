@@ -1,0 +1,342 @@
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 8541962..b55c90a 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -13,8 +13,8 @@ android {
+         applicationId = "com.byso.halocardoverlay"
+         minSdk = 26
+         targetSdk = 35
+-        versionCode = 11
+-        versionName = "2.0"
++        versionCode = 12
++        versionName = "2.1"
+     }
+ 
+     signingConfigs {
+diff --git a/app/src/main/java/com/byso/halocardoverlay/BalanceCaptureService.kt b/app/src/main/java/com/byso/halocardoverlay/BalanceCaptureService.kt
+index b144f48..df14254 100644
+--- a/app/src/main/java/com/byso/halocardoverlay/BalanceCaptureService.kt
++++ b/app/src/main/java/com/byso/halocardoverlay/BalanceCaptureService.kt
+@@ -49,6 +49,7 @@ class BalanceCaptureService : Service() {
+         private const val CHANNEL_ID = "halocard_live_balance"
+         private const val NOTIFICATION_ID = 624
+         private const val POLL_MS = 1250L
++        private const val HIDE_GRACE_MS = 1600L
+     }
+ 
+     private val mainHandler = Handler(Looper.getMainLooper())
+@@ -70,6 +71,12 @@ class BalanceCaptureService : Service() {
+     @Volatile private var scanning = false
+     @Volatile private var destroyed = false
+     @Volatile private var overlayVisible = false
++    private var lastConfirmedAt = 0L
++    @Volatile private var userStopped = false
++    // v2.1: Android only delivers a new frame when the screen changes. Keep the
++    // last frame so a still dashboard is still read (previously it could stay
++    // stuck on 'Scanning…'/'Verifying…' and Firefox could hide the bubble).
++    @Volatile private var lastFrame: Bitmap? = null
+     private val visibilityRunnable = object : Runnable {
+         override fun run() {
+             if (destroyed) return
+@@ -86,7 +93,12 @@ class BalanceCaptureService : Service() {
+         val visualVerified = firefoxActive() &&
+             visual.getBoolean("confirmed", false) &&
+             System.currentTimeMillis() - visual.getLong("last_frame_at", 0) in 0L..3200L
+-        val dashboard = accessibilityVerified || visualVerified
++        val confirmed = accessibilityVerified || visualVerified
++        val now = System.currentTimeMillis()
++        if (confirmed) lastConfirmedAt = now
++        // v2.1: a single failed browser check no longer hides the bubble. It must
++        // stay unconfirmed for HIDE_GRACE_MS, which stops flicker and repeated resets.
++        val dashboard = confirmed || (overlayVisible && now - lastConfirmedAt < HIDE_GRACE_MS)
+         val panel = overlay ?: return
+         if (dashboard != overlayVisible) {
+             Diagnostics.record(this, "Overlay", if (dashboard) "Showing on confirmed HaloCard dashboard" else "Hidden outside confirmed dashboard")
+@@ -155,7 +167,12 @@ class BalanceCaptureService : Service() {
+     }
+     private val captureCallback = object : MediaProjection.Callback() {
+         override fun onStop() {
+-            // The system or user has ended sharing. A new consent is needed to restart.
++            // The system or user has ended sharing (e.g. screen locked, or the
++            // status-bar 'stop sharing' chip). A new consent is needed to restart.
++            if (!userStopped && !destroyed) {
++                Diagnostics.record(this@BalanceCaptureService, "Capture", "Android ended screen sharing")
++                postRestartNotification()
++            }
+             stopSelf()
+         }
+ 
+@@ -179,6 +196,7 @@ class BalanceCaptureService : Service() {
+     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+         when (intent?.action) {
+             ACTION_STOP -> {
++                userStopped = true
+                 stopSelf()
+                 return START_NOT_STICKY
+             }
+@@ -223,6 +241,23 @@ class BalanceCaptureService : Service() {
+         return START_NOT_STICKY
+     }
+ 
++    private fun postRestartNotification() {
++        try {
++            createNotificationChannel()
++            val open = PendingIntent.getActivity(this, 2,
++                Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
++                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
++            val note = Notification.Builder(this, CHANNEL_ID)
++                .setSmallIcon(android.R.drawable.ic_menu_info_details)
++                .setContentTitle("HaloCard detection stopped")
++                .setContentText("Android ended screen sharing. Tap to start again.")
++                .setContentIntent(open)
++                .setAutoCancel(true)
++                .build()
++            (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).notify(NOTIFICATION_ID + 1, note)
++        } catch (_: Exception) {}
++    }
++
+     private fun createNotificationChannel() {
+         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+             val manager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+@@ -295,7 +330,14 @@ class BalanceCaptureService : Service() {
+     private fun scanFrame() {
+         if (destroyed || (!overlayVisible && !firefoxActive())) return
+         val reader = imageReader ?: return
+-        val image = try { reader.acquireLatestImage() } catch (_: Exception) { null } ?: return
++        val image = try { reader.acquireLatestImage() } catch (_: Exception) { null }
++        if (image == null) {
++            // Screen hasn't changed: re-read the last frame instead of skipping.
++            val cached = lastFrame ?: return
++            if (cached.isRecycled) return
++            runOcr(cached)
++            return
++        }
+         val bitmap = try {
+             val plane = image.planes.first()
+             val buffer = plane.buffer
+@@ -316,8 +358,16 @@ class BalanceCaptureService : Service() {
+             image.close()
+         }
+ 
++        // scanFrame only runs when no OCR is in progress, so the old frame is free.
++        val previous = lastFrame
++        lastFrame = bitmap
++        if (previous != null && previous !== bitmap && !previous.isRecycled) previous.recycle()
+         // No reason to scan other sites or the browser address bar when not on the dashboard.
+-        if (!overlayVisible && !firefoxActive()) { bitmap.recycle(); return }
++        if (!overlayVisible && !firefoxActive()) return
++        runOcr(bitmap)
++    }
++
++    private fun runOcr(bitmap: Bitmap) {
+         scanning = true
+         recognizer.process(InputImage.fromBitmap(bitmap, 0))
+             .addOnSuccessListener { result ->
+@@ -363,7 +413,6 @@ class BalanceCaptureService : Service() {
+                 }
+             }
+             .addOnCompleteListener {
+-                bitmap.recycle()
+                 scanning = false
+             }
+     }
+@@ -424,7 +473,7 @@ class BalanceCaptureService : Service() {
+             setTextColor(Color.rgb(255, 190, 190))
+             gravity = Gravity.CENTER
+             contentDescription = "Stop HaloCard scanning"
+-            setOnClickListener { stopSelf() }
++            setOnClickListener { userStopped = true; stopSelf() }
+         }
+         header.addView(close, LinearLayout.LayoutParams(dp(32), dp(32)))
+         panel.addView(header)
+@@ -548,6 +597,7 @@ class BalanceCaptureService : Service() {
+         virtualDisplay = null
+         imageReader = null
+         overlay = null
++        lastFrame = null // not recycled here: ML Kit may still be reading it
+         recognizer.close()
+         val prefs = getSharedPreferences("capture_status", MODE_PRIVATE)
+         if (!prefs.getString("status", "").orEmpty().startsWith("Capture failed")) {
+diff --git a/app/src/main/java/com/byso/halocardoverlay/DashboardAccessibilityService.kt b/app/src/main/java/com/byso/halocardoverlay/DashboardAccessibilityService.kt
+index 7595bba..2d9802b 100644
+--- a/app/src/main/java/com/byso/halocardoverlay/DashboardAccessibilityService.kt
++++ b/app/src/main/java/com/byso/halocardoverlay/DashboardAccessibilityService.kt
+@@ -41,6 +41,10 @@ class DashboardAccessibilityService : AccessibilityService() {
+     @Volatile private var running = false
+     @Volatile private var tabTransitionUntil = 0L
+     private var lastFirefoxProbe = 0L
++    // v2.1: last time the HaloCard address was actually seen, and in which browser.
++    // Lets the bubble survive moments when the toolbar is scrolled away.
++    private var lastVerifiedAt = 0L
++    private var lastVerifiedPkg = ""
+ 
+     private val periodic = object : Runnable {
+         override fun run() {
+@@ -72,14 +76,14 @@ class DashboardAccessibilityService : AccessibilityService() {
+         if (pkg == packageName || pkg.isBlank()) return
+         if (pkg in browsers) markForeground(pkg)
+         if (pkg !in browsers) {
+-            // Keyboard, notification and overlay events aren't navigations.
+-            // Hide when an actual foreground window changes to another app.
++            // v2.1: keyboard, status bar, MIUI/HyperOS system windows and other
++            // overlays also send these events while the browser stays in front.
++            // Previously they hid the bubble at once. Now re-check what is
++            // actually in the foreground instead.
+             if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
+                 event.eventType == AccessibilityEvent.TYPE_WINDOWS_CHANGED) {
+-                checks?.post {
+-                    markForeground(pkg)
+-                    setState(false, "Outside supported browser")
+-                }
++                checks?.removeCallbacks(onEventCheck)
++                checks?.postDelayed(onEventCheck, 200L)
+             }
+             return
+         }
+@@ -123,11 +127,14 @@ class DashboardAccessibilityService : AccessibilityService() {
+ 
+     private fun inspectActiveWindow() {
+         if (SystemClock.elapsedRealtime() < tabTransitionUntil) {
++            lastVerifiedAt = 0L
+             setState(false, "Firefox tab change in progress")
+             return
+         }
+         val root = rootInActiveWindow ?: run {
+-            setState(false, "Active browser window not available")
++            // Often momentary (window animating). Don't hide; if it lasts, the
++            // overlay hides by itself once this check goes stale.
++            unverified("Active browser window not available", null)
+             return
+         }
+         val queue = ArrayDeque<AccessibilityNodeInfo>()
+@@ -138,11 +145,13 @@ class DashboardAccessibilityService : AccessibilityService() {
+         var cardsText = false
+         var tabTrayOpen = false
+         var isFirefox = false
++        var addressSeen = false
+         var visited = 0
+         val start = SystemClock.elapsedRealtime()
+         try {
+             val pkg = root.packageName?.toString().orEmpty()
+             if (pkg !in browsers) {
++                markForeground(pkg)
+                 setState(false, "Outside supported browser")
+                 return
+             }
+@@ -152,8 +161,8 @@ class DashboardAccessibilityService : AccessibilityService() {
+             // GeckoView can take considerably longer to expose toolbar nodes
+             // than Chrome. This entire scan runs on HaloCardBrowserCheck,
+             // never the Android UI thread.
+-            val maximumNodes = if (isFirefox) 1100 else 420
+-            val maximumMs = if (isFirefox) 460L else 170L
++            val maximumNodes = if (isFirefox) 1100 else 800
++            val maximumMs = if (isFirefox) 460L else 320L
+             while (queue.isNotEmpty() && visited < maximumNodes &&
+                    SystemClock.elapsedRealtime() - start < maximumMs) {
+                 val node = queue.removeFirst()
+@@ -171,10 +180,12 @@ class DashboardAccessibilityService : AccessibilityService() {
+                     if (content.contains("spending power", true) || description.contains("spending power", true)) dashboardText = true
+                     if (content.contains("new card", true) || content.contains("all-time limit", true)) cardsText = true
+                     if (isAddressNode(node, id)) {
++                        if (content.isNotBlank() || description.isNotBlank()) addressSeen = true
+                         if (dashboardUrl.containsMatchIn(content) || dashboardUrl.containsMatchIn(description)) urlsFound = true
+                         if (dashboardHost.containsMatchIn(content) || dashboardHost.containsMatchIn(description)) hostFound = true
+                     }
+-                    if (urlsFound) break // Verified the current visible toolbar; don't traverse GeckoView unnecessarily.
++                    // Verified the current visible toolbar; don't traverse GeckoView unnecessarily.
++                    if (urlsFound || hostFound) break
+                     for (i in 0 until node.childCount) {
+                         node.getChild(i)?.let { queue.add(it) }
+                     }
+@@ -189,13 +200,23 @@ class DashboardAccessibilityService : AccessibilityService() {
+             getSharedPreferences("dashboard_visibility", MODE_PRIVATE).edit()
+                 .putBoolean("tab_tray_open", tabTrayOpen).apply()
+             if (tabTrayOpen) {
++                lastVerifiedAt = 0L
+                 setState(false, "Firefox tab selector open")
+-            } else if (urlsFound || (hostFound && dashboardText && cardsText)) {
++            } else if (urlsFound || hostFound) {
++                // v2.1: Chrome usually shows only the site name (no /dashboard
++                // path) in its address bar, so the HaloCard host is enough. The
++                // balance itself is only shown when OCR finds 'spent of limit'.
++                lastVerifiedAt = SystemClock.elapsedRealtime()
++                lastVerifiedPkg = pkg
+                 setState(true, "HaloCard active in ${if (isFirefox) "Firefox" else "Chrome"}")
++            } else if (addressSeen) {
++                // The address bar is visible and it is some other site: definite hide.
++                lastVerifiedAt = 0L
++                setState(false, "Current tab is not HaloCard — overlay hidden")
+             } else {
+-                setState(false, if (!hostFound && !urlsFound)
+-                    "Current tab URL not verified — overlay hidden"
+-                    else "Current tab is not confirmed as dashboard")
++                // Address bar not visible (scrolled away, page loading, slow GeckoView).
++                unverified(if (dashboardText || cardsText) "Address bar hidden; HaloCard page text visible"
++                    else "Address bar not visible", pkg)
+             }
+         } finally {
+             // Recycle queued, unvisited nodes too; do not recycle root twice.
+@@ -203,6 +224,23 @@ class DashboardAccessibilityService : AccessibilityService() {
+         }
+     }
+ 
++    /**
++     * Couldn't see the address this time. If HaloCard was verified in this same
++     * browser in the last 90 s and no other site has been seen since, keep it
++     * shown (e.g. Chrome hides its toolbar while you scroll). Otherwise hide.
++     */
++    private fun unverified(status: String, pkg: String?) {
++        val recent = lastVerifiedAt > 0 &&
++            SystemClock.elapsedRealtime() - lastVerifiedAt < 90_000L &&
++            (pkg == null || pkg == lastVerifiedPkg)
++        if (recent) {
++            if (pkg == null) return // leave the last result; it goes stale on its own
++            setState(true, "HaloCard (toolbar hidden) in ${if (pkg.startsWith("org.mozilla.")) "Firefox" else "Chrome"}")
++        } else {
++            setState(false, status)
++        }
++    }
++
+     private fun isAddressNode(node: AccessibilityNodeInfo, id: String): Boolean {
+         val last = id.substringAfterLast(":id/", id)
+         if (addressIds.any { key -> last == key || last.startsWith("${key}_") || last.endsWith("_${key}") }) return true
+diff --git a/app/src/main/java/com/byso/halocardoverlay/Diagnostics.kt b/app/src/main/java/com/byso/halocardoverlay/Diagnostics.kt
+index 0a12041..6a88fab 100644
+--- a/app/src/main/java/com/byso/halocardoverlay/Diagnostics.kt
++++ b/app/src/main/java/com/byso/halocardoverlay/Diagnostics.kt
+@@ -35,7 +35,13 @@ object Diagnostics {
+         return buildString {
+             appendLine("HaloCard Live Overlay Diagnostic Report")
+             appendLine("Generated: ${format.format(Date())}")
+-            appendLine("App: 1.9 / versionCode 10")
++            val version = try {
++                @Suppress("DEPRECATION")
++                context.packageManager.getPackageInfo(context.packageName, 0).let {
++                    "${it.versionName} / versionCode ${if (Build.VERSION.SDK_INT >= 28) it.longVersionCode else it.versionCode.toLong()}"
++                }
++            } catch (_: Exception) { "unknown" }
++            appendLine("App: $version")
+             appendLine("Android API: ${Build.VERSION.SDK_INT}")
+             appendLine("Device: ${Build.MANUFACTURER} ${Build.MODEL}")
+             appendLine("Website check: ${window.getString("status", "not checked")}")
+diff --git a/app/src/main/java/com/byso/halocardoverlay/MainActivity.kt b/app/src/main/java/com/byso/halocardoverlay/MainActivity.kt
+index c491c16..b3d00ef 100644
+--- a/app/src/main/java/com/byso/halocardoverlay/MainActivity.kt
++++ b/app/src/main/java/com/byso/halocardoverlay/MainActivity.kt
+@@ -83,7 +83,7 @@ class MainActivity : Activity() {
+             Toast.makeText(this, "Diagnostic history cleared", Toast.LENGTH_SHORT).show()
+             updateStatus()
+         })
+-        layout.addView(description("Only secure.halocard.co/dashboard in Chrome or Firefox makes the live bubble visible. The browser address must be detectable by Accessibility. If the bubble does not appear, read the live diagnostics above.\n\nUsage: Allow the floating window, tap Start, grant Android's screen-sharing permission, and return to HaloCard in Chrome or Firefox. The overlay checks roughly every 1.5 seconds and updates when you switch cards. Tap the small US$ bubble to expand its details. Drag the bubble to move it. Tap again to collapse. Use Stop here to end.\n\nAndroid may ask again when you start a new capture session; it does not ask for every new card."))
++        layout.addView(description("Only secure.halocard.co in Chrome or Firefox makes the live bubble visible. The browser address must be detectable by Accessibility. If the bubble does not appear, read the live diagnostics above.\n\nUsage: Allow the floating window, tap Start, grant Android's screen-sharing permission, and return to HaloCard in Chrome or Firefox. The overlay checks roughly every 1.5 seconds and updates when you switch cards. Tap the small US$ bubble to expand its details. Drag the bubble to move it. Tap again to collapse. Use Stop here to end.\n\nAndroid may ask again when you start a new capture session; it does not ask for every new card."))
+         setContentView(scroller)
+         Diagnostics.record(this, "App", "Settings and diagnostics screen opened")
+         if (Build.VERSION.SDK_INT >= 33 &&
+@@ -157,6 +157,7 @@ class MainActivity : Activity() {
+                     putExtra(BalanceCaptureService.EXTRA_RESULT_CODE, resultCode)
+                     putExtra(BalanceCaptureService.EXTRA_RESULT_DATA, data)
+                 }
++                (getSystemService(NOTIFICATION_SERVICE) as android.app.NotificationManager).cancel(625)
+                 startForegroundService(serviceIntent)
+                 Diagnostics.record(this, "App", "Screen capture consent accepted")
+                 Toast.makeText(this, "Live balance detection starting", Toast.LENGTH_SHORT).show()

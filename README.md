@@ -8,4 +8,4 @@ The APK is built by **GitHub Actions**. After configuring the `HALOCARD_SIGNING_
 
 Keep the keystore backup private and safe. Every future release must use the same signing certificate and application ID, with a larger Android `versionCode`, for upgrades without reinstalling.
 
-The v1.6 app includes an expandable, movable balance bubble and an exportable diagnostics log. Android permissions and Firefox behavior still need testing on the target tablet.
+v2.1 fixes the intermittent bubble: it reads still screens, ignores keyboard/system-window flicker, and stays up when Chrome hides its address bar. The v1.6 app includes an expandable, movable balance bubble and an exportable diagnostics log. Android permissions and Firefox behavior still need testing on the target tablet.

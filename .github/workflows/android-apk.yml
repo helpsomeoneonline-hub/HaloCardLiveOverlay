@@ -58,10 +58,15 @@ jobs:
           python3 .github/scripts/fix_card_amount_v20.py
           grep -q 'versionCode = 11' app/build.gradle.kts
           grep -q 'repeatedBalanceFrames >= 2' app/src/main/java/com/byso/halocardoverlay/BalanceCaptureService.kt
+      - name: Reliability fixes for v2.1 (static-frame OCR, no flicker, toolbar-hidden support)
+        run: |
+          patch --batch -p1 < patches/halocard-v2.1-reliability.patch
+          grep -q 'versionCode = 12' app/build.gradle.kts
+          grep -q 'HIDE_GRACE_MS' app/src/main/java/com/byso/halocardoverlay/BalanceCaptureService.kt
       - name: Upload source snapshot for Firefox diagnosis
         uses: actions/upload-artifact@v4
         with:
-          name: HaloCard-v2.0-reconstructed-source
+          name: HaloCard-v2.1-reconstructed-source
           path: |
             app/src/main/java/com/byso/halocardoverlay/
             app/src/main/AndroidManifest.xml
@@ -104,7 +109,7 @@ jobs:
       - name: Upload built APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: HaloCard-Live-Overlay-v2.0-apk
+          name: HaloCard-Live-Overlay-v2.1-apk
           path: ${{ steps.buildapk.outputs.apk }}
           if-no-files-found: error
       - name: Publish permanently signed APK
@@ -112,10 +117,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create v2.0.0 "app/build/outputs/apk/release/app-release.apk#HaloCardLiveOverlay-v2.0.apk" --title "HaloCard Live Overlay 2.0" --notes "Permanently signed. Rejects OCR readings when the spent amount exceeds a recognized card limit, and confirms the card figures across two consecutive captures before updating. Chrome and Firefox behavior preserved." --target "$GITHUB_SHA" || gh release upload v2.0.0 "app/build/outputs/apk/release/app-release.apk#HaloCardLiveOverlay-v2.0.apk" --clobber
+          gh release create v2.1.0 "app/build/outputs/apk/release/app-release.apk#HaloCardLiveOverlay-v2.1.apk" --title "HaloCard Live Overlay 2.1" --notes "Reliability update: reads the balance even when the screen is still, no bubble flicker from keyboard or system windows, stays visible when Chrome hides its address bar while scrolling, and notifies you if Android stops screen sharing." --target "$GITHUB_SHA" || gh release upload v2.1.0 "app/build/outputs/apk/release/app-release.apk#HaloCardLiveOverlay-v2.1.apk" --clobber
       - name: Publish temporary debug preview
         if: steps.buildapk.outputs.stable != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create v2.0.0-preview "app/build/outputs/apk/debug/app-debug.apk#HaloCardLiveOverlay-v2.0-PREVIEW.apk" --title "HaloCard Live Overlay 2.0 Preview" --notes "Debug-signed preview; not an upgrade to permanent release." --target "$GITHUB_SHA" || gh release upload v2.0.0-preview "app/build/outputs/apk/debug/app-debug.apk#HaloCardLiveOverlay-v2.0-PREVIEW.apk" --clobber
+          gh release create v2.1.0-preview "app/build/outputs/apk/debug/app-debug.apk#HaloCardLiveOverlay-v2.1-PREVIEW.apk" --title "HaloCard Live Overlay 2.1 Preview" --notes "Debug-signed preview; not an upgrade to permanent release." --target "$GITHUB_SHA" || gh release upload v2.1.0-preview "app/build/outputs/apk/debug/app-debug.apk#HaloCardLiveOverlay-v2.1-PREVIEW.apk" --clobber
