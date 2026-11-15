@@ -63,10 +63,15 @@ jobs:
           patch --batch -p1 < patches/halocard-v2.1-reliability.patch
           grep -q 'versionCode = 12' app/build.gradle.kts
           grep -q 'HIDE_GRACE_MS' app/src/main/java/com/byso/halocardoverlay/BalanceCaptureService.kt
+      - name: Keep balance while scrolling for v2.2
+        run: |
+          patch --batch -p1 < patches/halocard-v2.2-scroll.patch
+          grep -q 'versionCode = 13' app/build.gradle.kts
+          grep -q 'fun definiteLeave' app/src/main/java/com/byso/halocardoverlay/DashboardAccessibilityService.kt
       - name: Upload source snapshot for Firefox diagnosis
         uses: actions/upload-artifact@v4
         with:
-          name: HaloCard-v2.1-reconstructed-source
+          name: HaloCard-v2.2-reconstructed-source
           path: |
             app/src/main/java/com/byso/halocardoverlay/
             app/src/main/AndroidManifest.xml
@@ -109,7 +114,7 @@ jobs:
       - name: Upload built APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: HaloCard-Live-Overlay-v2.1-apk
+          name: HaloCard-Live-Overlay-v2.2-apk
           path: ${{ steps.buildapk.outputs.apk }}
           if-no-files-found: error
       - name: Publish permanently signed APK
@@ -117,10 +122,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create v2.1.0 "app/build/outputs/apk/release/app-release.apk#HaloCardLiveOverlay-v2.1.apk" --title "HaloCard Live Overlay 2.1" --notes "Reliability update: reads the balance even when the screen is still, no bubble flicker from keyboard or system windows, stays visible when Chrome hides its address bar while scrolling, notifies you if Android stops screen sharing, shows a new card's balance faster, and skips repeat text recognition on unchanged screens to save battery." --target "$GITHUB_SHA" || gh release upload v2.1.0 "app/build/outputs/apk/release/app-release.apk#HaloCardLiveOverlay-v2.1.apk" --clobber
+          gh release create v2.2.0 "app/build/outputs/apk/release/app-release.apk#HaloCardLiveOverlay-v2.2.apk" --title "HaloCard Live Overlay 2.2" --notes "The bubble stays visible and keeps the last balance while you scroll down the HaloCard page in Chrome or Firefox. Includes all 2.1 reliability and battery improvements." --target "$GITHUB_SHA" || gh release upload v2.2.0 "app/build/outputs/apk/release/app-release.apk#HaloCardLiveOverlay-v2.2.apk" --clobber
       - name: Publish temporary debug preview
         if: steps.buildapk.outputs.stable != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create v2.1.0-preview "app/build/outputs/apk/debug/app-debug.apk#HaloCardLiveOverlay-v2.1-PREVIEW.apk" --title "HaloCard Live Overlay 2.1 Preview" --notes "Debug-signed preview; not an upgrade to permanent release." --target "$GITHUB_SHA" || gh release upload v2.1.0-preview "app/build/outputs/apk/debug/app-debug.apk#HaloCardLiveOverlay-v2.1-PREVIEW.apk" --clobber
+          gh release create v2.2.0-preview "app/build/outputs/apk/debug/app-debug.apk#HaloCardLiveOverlay-v2.2-PREVIEW.apk" --title "HaloCard Live Overlay 2.2 Preview" --notes "Debug-signed preview; not an upgrade to permanent release." --target "$GITHUB_SHA" || gh release upload v2.2.0-preview "app/build/outputs/apk/debug/app-debug.apk#HaloCardLiveOverlay-v2.2-PREVIEW.apk" --clobber

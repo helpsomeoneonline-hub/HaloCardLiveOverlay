@@ -1,0 +1,146 @@
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index b55c90a..50e6650 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -13,8 +13,8 @@ android {
+         applicationId = "com.byso.halocardoverlay"
+         minSdk = 26
+         targetSdk = 35
+-        versionCode = 12
+-        versionName = "2.1"
++        versionCode = 13
++        versionName = "2.2"
+     }
+ 
+     signingConfigs {
+diff --git a/app/src/main/java/com/byso/halocardoverlay/BalanceCaptureService.kt b/app/src/main/java/com/byso/halocardoverlay/BalanceCaptureService.kt
+index e460273..93ce363 100644
+--- a/app/src/main/java/com/byso/halocardoverlay/BalanceCaptureService.kt
++++ b/app/src/main/java/com/byso/halocardoverlay/BalanceCaptureService.kt
+@@ -168,8 +168,11 @@ class BalanceCaptureService : Service() {
+         else { firefoxMisses++; firefoxMatches = 0 }
+         val current = getSharedPreferences("firefox_visual", MODE_PRIVATE)
+         val previous = current.getBoolean("confirmed", false)
++        // v2.2: once confirmed, stay confirmed while Firefox stays on this page;
++        // scrolling hides the card text. The accessibility check clears this when
++        // another site, the tab tray or another app is seen.
+         val confirmed = if (firefoxMatches >= 2) true
+-            else if (firefoxMisses >= 2) false else previous
++            else if (firefoxMisses >= 2 && !previous) false else previous
+         current.edit().putBoolean("confirmed", confirmed)
+             .putLong("last_frame_at", System.currentTimeMillis()).apply()
+         val now = System.currentTimeMillis()
+@@ -429,9 +432,8 @@ class BalanceCaptureService : Service() {
+                 repeatedBalanceFrames = 0
+                 needsFastPoll = true
+                 if (consecutiveMisses == 3) {
+-                    publishedBalance = null
+                     Diagnostics.record(this, "OCR", "Text recognition failed three times")
+-                    showStatus("—", "Text not detected")
++                    if (publishedBalance == null) showStatus("—", "Text not detected")
+                 }
+             }
+             .addOnCompleteListener {
+@@ -466,9 +468,13 @@ class BalanceCaptureService : Service() {
+             pendingBalance = null
+             repeatedBalanceFrames = 0
+             if (consecutiveMisses == 3) {
+-                publishedBalance = null
+                 Diagnostics.record(this, "OCR", "Three captures without a matching reliable card amount")
+-                showStatus("—", "Waiting for a clear 'spent of limit' reading")
++                // v2.2: the card amount has usually just scrolled off screen. Keep
++                // showing the last confirmed balance while still on HaloCard; it is
++                // cleared when you leave the page or switch tabs.
++                val last = publishedBalance
++                if (last != null) showStatus(remainingText(last), "Last reading • scroll up to refresh")
++                else showStatus("—", "Waiting for a clear 'spent of limit' reading")
+             }
+         }
+         // Poll quickly until the current card's figures are confirmed.
+@@ -478,14 +484,16 @@ class BalanceCaptureService : Service() {
+     }
+ 
+     private fun showBalance(card: BalanceAmounts) {
+-        val remaining = card.limit.subtract(card.spent)
+-        val number = remaining.setScale(2, RoundingMode.HALF_UP)
+-        val currency = "US$" + String.format(Locale.US, "%,.2f", number)
++        val currency = remainingText(card)
+         // Do not include the OCR trigger phrase inside the overlay; otherwise the
+         // next capture can repeatedly read our own stale card value.
+         showStatus(currency, "Used ${asCurrency(card.spent)}  •  Limit ${asCurrency(card.limit)}")
+     }
+ 
++    private fun remainingText(card: BalanceAmounts): String =
++        "US$" + String.format(Locale.US, "%,.2f",
++            card.limit.subtract(card.spent).setScale(2, RoundingMode.HALF_UP))
++
+     private fun asCurrency(value: BigDecimal): String =
+         "US$" + String.format(Locale.US, "%,.2f", value)
+ 
+diff --git a/app/src/main/java/com/byso/halocardoverlay/DashboardAccessibilityService.kt b/app/src/main/java/com/byso/halocardoverlay/DashboardAccessibilityService.kt
+index 4c553a8..edf12b1 100644
+--- a/app/src/main/java/com/byso/halocardoverlay/DashboardAccessibilityService.kt
++++ b/app/src/main/java/com/byso/halocardoverlay/DashboardAccessibilityService.kt
+@@ -129,7 +129,7 @@ class DashboardAccessibilityService : AccessibilityService() {
+ 
+     private fun inspectActiveWindow() {
+         if (SystemClock.elapsedRealtime() < tabTransitionUntil) {
+-            lastVerifiedAt = 0L
++            definiteLeave()
+             setState(false, "Firefox tab change in progress")
+             return
+         }
+@@ -154,6 +154,7 @@ class DashboardAccessibilityService : AccessibilityService() {
+             val pkg = root.packageName?.toString().orEmpty()
+             if (pkg !in browsers) {
+                 markForeground(pkg)
++                definiteLeave()
+                 setState(false, "Outside supported browser")
+                 return
+             }
+@@ -202,7 +203,7 @@ class DashboardAccessibilityService : AccessibilityService() {
+             getSharedPreferences("dashboard_visibility", MODE_PRIVATE).edit()
+                 .putBoolean("tab_tray_open", tabTrayOpen).apply()
+             if (tabTrayOpen) {
+-                lastVerifiedAt = 0L
++                definiteLeave()
+                 setState(false, "Firefox tab selector open")
+             } else if (urlsFound || hostFound) {
+                 // v2.1: Chrome usually shows only the site name (no /dashboard
+@@ -213,7 +214,7 @@ class DashboardAccessibilityService : AccessibilityService() {
+                 setState(true, "HaloCard active in ${if (isFirefox) "Firefox" else "Chrome"}")
+             } else if (addressSeen) {
+                 // The address bar is visible and it is some other site: definite hide.
+-                lastVerifiedAt = 0L
++                definiteLeave()
+                 setState(false, "Current tab is not HaloCard — overlay hidden")
+             } else {
+                 // Address bar not visible (scrolled away, page loading, slow GeckoView).
+@@ -228,12 +229,11 @@ class DashboardAccessibilityService : AccessibilityService() {
+ 
+     /**
+      * Couldn't see the address this time. If HaloCard was verified in this same
+-     * browser in the last 90 s and no other site has been seen since, keep it
++     * browser and no other site, tab or app has been seen since, keep it
+      * shown (e.g. Chrome hides its toolbar while you scroll). Otherwise hide.
+      */
+     private fun unverified(status: String, pkg: String?) {
+         val recent = lastVerifiedAt > 0 &&
+-            SystemClock.elapsedRealtime() - lastVerifiedAt < 90_000L &&
+             (pkg == null || pkg == lastVerifiedPkg)
+         if (recent) {
+             if (pkg == null) return // leave the last result; it goes stale on its own
+@@ -243,6 +243,13 @@ class DashboardAccessibilityService : AccessibilityService() {
+         }
+     }
+ 
++    /** Left HaloCard for sure: forget both the address and the Firefox visual confirmation. */
++    private fun definiteLeave() {
++        lastVerifiedAt = 0L
++        val visual = getSharedPreferences("firefox_visual", MODE_PRIVATE)
++        if (visual.getBoolean("confirmed", false)) visual.edit().putBoolean("confirmed", false).apply()
++    }
++
+     private fun isAddressNode(node: AccessibilityNodeInfo, id: String): Boolean {
+         val last = id.substringAfterLast(":id/", id)
+         if (addressIds.any { key -> last == key || last.startsWith("${key}_") || last.endsWith("_${key}") }) return true
